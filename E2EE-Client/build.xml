@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project name="E2EE-Client" default="jar" basedir=".">
+    <description>E2EE-Client: Java Swing Desktop Client with E2EE Security (Pure JDK 17)</description>
+    <property file="nbproject/project.properties"/>
+
+    <target name="-init">
+        <property name="project.E2EE-Common" value="../E2EE-Common"/>
+        <property name="reference.E2EE-Common.jar" value="${project.E2EE-Common}/dist/E2EE-Common.jar"/>
+        <property name="src.dir" value="src"/>
+        <property name="build.dir" value="build"/>
+        <property name="build.classes.dir" value="${build.dir}/classes"/>
+        <property name="dist.dir" value="dist"/>
+        <property name="dist.jar" value="${dist.dir}/E2EE-Client.jar"/>
+        <property name="main.class" value="com.e2ee.client.ClientMain"/>
+        <property name="javac.source" value="17"/>
+        <property name="javac.target" value="17"/>
+        <mkdir dir="${build.classes.dir}"/>
+        <mkdir dir="${dist.dir}"/>
+    </target>
+
+    <target name="-check-common-jar" depends="-init">
+        <available file="${reference.E2EE-Common.jar}" property="common.jar.exists"/>
+    </target>
+
+    <target name="build-common" depends="-check-common-jar" unless="common.jar.exists">
+        <echo message="Tự động biên dịch phụ thuộc E2EE-Common trước..."/>
+        <ant dir="${project.E2EE-Common}" target="jar" inheritAll="false"/>
+    </target>
+
+    <target name="compile" depends="-init,build-common" description="Biên dịch mã nguồn Java Client">
+        <javac srcdir="${src.dir}" destdir="${build.classes.dir}" classpath="${reference.E2EE-Common.jar}" source="${javac.source}" target="${javac.target}" includeantruntime="false" encoding="UTF-8"/>
+    </target>
+
+    <target name="jar" depends="compile" description="Đóng gói E2EE-Client.jar">
+        <jar destfile="${dist.jar}" basedir="${build.classes.dir}">
+            <manifest>
+                <attribute name="Main-Class" value="${main.class}"/>
+                <attribute name="Class-Path" value="E2EE-Common.jar"/>
+                <attribute name="Implementation-Title" value="E2EE-Client"/>
+                <attribute name="Implementation-Version" value="1.0.0"/>
+            </manifest>
+        </jar>
+    </target>
+
+    <target name="run" depends="jar" description="Khởi chạy E2EE Client Swing UI">
+        <java classname="${main.class}" fork="true">
+            <classpath>
+                <pathelement location="${dist.jar}"/>
+                <pathelement location="${reference.E2EE-Common.jar}"/>
+            </classpath>
+        </java>
+    </target>
+
+    <target name="clean" description="Dọn dẹp thư mục build và dist">
+        <delete dir="build"/>
+        <delete dir="dist"/>
+    </target>
+
+    <target name="rebuild" depends="clean,jar" description="Dọn dẹp và build lại toàn bộ"/>
+    <target name="default" depends="jar"/>
+</project>

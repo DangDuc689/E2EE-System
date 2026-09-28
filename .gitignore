@@ -1,0 +1,37 @@
+# ==============================================================================
+# .gitignore chuẩn đồ án E2EE-System
+# Tuân thủ nghiêm ngặt Quy trình và Ràng buộc thực hiện dự án trên Git
+# Nghiêm cấm commit file nhị phân (.jar), file build, file cấu hình cá nhân
+# ==============================================================================
+
+# Thư mục build và phân phối (NetBeans Ant)
+**/build/
+**/dist/
+**/nbproject/private/
+
+# Bytecode Java và file đóng gói lưu trữ (TUYỆT ĐỐI KHÔNG COMMIT .jar)
+*.class
+*.jar
+*.war
+*.ear
+
+# IDE Cá nhân (VS Code, IntelliJ IDEA, Eclipse)
+.idea/
+.vscode/
+*.iml
+*.ipr
+*.iws
+.settings/
+.project
+.classpath
+
+# File hệ điều hành & Tạm
+.DS_Store
+Thumbs.db
+*.tmp
+*.bak
+*.log
+
+# Thư mục AI Agent và Ghi chú cá nhân/nội bộ
+.agent/
+Note/

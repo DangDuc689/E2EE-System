@@ -8,6 +8,8 @@
 **/build/
 **/dist/
 **/nbproject/private/
+**/nbproject/build-impl.xml
+**/nbproject/genfiles.properties
 
 # Bytecode Java và file đóng gói lưu trữ (TUYỆT ĐỐI KHÔNG COMMIT .jar)
 *.class

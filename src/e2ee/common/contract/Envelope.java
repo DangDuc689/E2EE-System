@@ -1,4 +1,4 @@
-package com.e2ee.common.contract;
+package e2ee.common.contract;
 
 import java.nio.charset.StandardCharsets;
 import java.util.HashMap;

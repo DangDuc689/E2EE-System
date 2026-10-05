@@ -1,4 +1,4 @@
-package com.e2ee.common.contract;
+package e2ee.common.contract;
 
 import java.io.Closeable;
 import java.io.IOException;

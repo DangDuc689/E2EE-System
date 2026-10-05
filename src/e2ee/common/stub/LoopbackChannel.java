@@ -1,7 +1,7 @@
-package com.e2ee.common.stub;
+package e2ee.common.stub;
 
-import com.e2ee.common.contract.Envelope;
-import com.e2ee.common.contract.PacketChannel;
+import e2ee.common.contract.Envelope;
+import e2ee.common.contract.PacketChannel;
 
 import java.io.IOException;
 import java.util.concurrent.BlockingQueue;

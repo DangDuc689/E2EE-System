@@ -1,7 +1,7 @@
-package com.e2ee.server;
+package e2ee.server;
 
-import com.e2ee.common.contract.Envelope;
-import com.e2ee.common.contract.Opcode;
+import e2ee.common.contract.Envelope;
+import e2ee.common.contract.Opcode;
 
 /**
  * Điểm khởi chạy của máy chủ E2EE Server (Blind Relay & Key Registry).
@@ -16,15 +16,15 @@ public class ServerMain {
 
     public static void main(String[] args) {
         System.out.println("===============================================================");
-        System.out.println("🚀 E2EE CHAT RELAY SERVER (Pure JDK 17)");
-        System.out.println("Học phần: Lập trình mạng - Lớp: 23DTHA5 - Nhóm: 04");
+        System.out.println("[E2EE-SERVER] KHOI CHAY CHAT RELAY SERVER (Pure JDK 17)");
+        System.out.println("Hoc phan: Lap trinh mang - Lop: 23DTHA5 - Nhom: 04");
         System.out.println("===============================================================");
-        System.out.println("[INFO] Khởi tạo máy chủ thành công trên cổng mặc định: " + DEFAULT_PORT);
+        System.out.println("[INFO] Khoi tao may chu thanh cong tren cong mac dinh: " + DEFAULT_PORT);
 
-        // Kiểm tra tính toàn vẹn liên kết với thư viện E2EE-Common
+        // Kiem tra tinh toan ven lien ket voi thu vien E2EE-Common
         Envelope probe = Envelope.create(Opcode.PING, "server-core", "broadcast");
-        System.out.println("[INFO] Kiểm tra liên kết E2EE-Common DTO: " + probe);
-        System.out.println("[INFO] Sẵn sàng triển khai Issue 3 (Socket Thread Pool) & Issue 4 (Key Registry).");
+        System.out.println("[INFO] Kiem tra lien ket E2EE-Common DTO: " + probe);
+        System.out.println("[INFO] San sang trien khai Issue 3 (Socket Thread Pool) & Issue 4 (Key Registry).");
         System.out.println("===============================================================");
     }
 }

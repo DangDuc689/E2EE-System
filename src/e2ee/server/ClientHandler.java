@@ -10,12 +10,19 @@ import java.io.IOException;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
+import java.security.SecureRandom;
+import java.util.Base64;
+import java.util.regex.Pattern;
 
 final class ClientHandler implements Runnable {
     private static final int CLIENT_TIMEOUT_MS = 90_000;
+    private static final int AUTH_NONCE_BYTES = 32;
+    private static final Pattern USERNAME_PATTERN = Pattern.compile("^[a-z0-9_]{3,20}$");
+    private static final SecureRandom SECURE_RANDOM = new SecureRandom();
 
     private final Socket clientSocket;
     private final Runnable onClose;
+    private byte[] challengeNonce;
 
     ClientHandler(Socket clientSocket) {
         this(clientSocket, () -> {
@@ -39,6 +46,7 @@ final class ClientHandler implements Runnable {
 
         try (Socket socket = clientSocket;
                 SocketPacketChannel channel = new SocketPacketChannel(socket)) {
+            sendAuthChallenge(channel);
             socket.setSoTimeout(CLIENT_TIMEOUT_MS);
             System.out.println("[E2EE-SERVER] Client da ket noi: "
                     + clientAddress
@@ -84,6 +92,22 @@ final class ClientHandler implements Runnable {
             onClose.run();
             System.out.println("[E2EE-SERVER] Da cleanup client: " + clientAddress);
         }
+    }
+
+    static boolean isValidUsername(String username) {
+        return username != null
+                && !"server".equals(username)
+                && !username.contains("|")
+                && USERNAME_PATTERN.matcher(username).matches();
+    }
+
+    private void sendAuthChallenge(SocketPacketChannel channel) throws IOException {
+        challengeNonce = new byte[AUTH_NONCE_BYTES];
+        SECURE_RANDOM.nextBytes(challengeNonce);
+
+        Envelope challenge = Envelope.create(Opcode.AUTH_CHALLENGE, "server", null)
+                .put("nonce", Base64.getEncoder().encodeToString(challengeNonce));
+        channel.send(challenge);
     }
 
     private static void logEnvelopeMetadata(Envelope envelope) {

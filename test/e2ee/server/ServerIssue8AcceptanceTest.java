@@ -17,6 +17,8 @@ import java.security.KeyPair;
 import java.security.KeyPairGenerator;
 import java.security.Signature;
 import java.util.Base64;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicReference;
 
 public final class ServerIssue8AcceptanceTest {
@@ -46,6 +48,10 @@ public final class ServerIssue8AcceptanceTest {
                 ServerIssue8AcceptanceTest::testInvalidAuthBodyType);
         TestSupport.check("AUTH co Base64 hoac public key khong hop le",
                 ServerIssue8AcceptanceTest::testMalformedBase64AndPublicKey);
+        TestSupport.check("TOFU ghim khoa o lan AUTH dau tien",
+                ServerIssue8AcceptanceTest::testTrustOnFirstUse);
+        TestSupport.check("TOFU tu choi private key khac cho username da co",
+                ServerIssue8AcceptanceTest::testRegisteredKeyRejectsImpersonation);
         TestSupport.summary();
     }
 
@@ -228,6 +234,52 @@ public final class ServerIssue8AcceptanceTest {
         }
     }
 
+    private static void testTrustOnFirstUse() throws Exception {
+        ConcurrentMap<String, String> registry = new ConcurrentHashMap<>();
+        KeyPair registeredKeyPair = generateRsaKeyPair();
+        String registeredPublicKey = Base64.getEncoder()
+                .encodeToString(registeredKeyPair.getPublic().getEncoded());
+
+        try (HandlerSession session = HandlerSession.open(registry)) {
+            byte[] nonce = Base64.getDecoder().decode(
+                    assertChallenge(session.client.receive()));
+            session.client.send(createAuth("alice",
+                    signNonce(nonce, registeredKeyPair), registeredPublicKey));
+            TestSupport.assertEquals(Opcode.AUTH_OK, session.client.receive().getOp());
+        }
+        TestSupport.assertEquals(registeredPublicKey, registry.get("alice"));
+
+        try (HandlerSession session = HandlerSession.open(registry)) {
+            byte[] nonce = Base64.getDecoder().decode(
+                    assertChallenge(session.client.receive()));
+            session.client.send(createAuth("alice",
+                    signNonce(nonce, registeredKeyPair), "ignored-pubkey"));
+            TestSupport.assertEquals(Opcode.AUTH_OK, session.client.receive().getOp());
+        }
+        TestSupport.assertEquals(registeredPublicKey, registry.get("alice"));
+    }
+
+    private static void testRegisteredKeyRejectsImpersonation() throws Exception {
+        ConcurrentMap<String, String> registry = new ConcurrentHashMap<>();
+        KeyPair registeredKeyPair = generateRsaKeyPair();
+        KeyPair attackerKeyPair = generateRsaKeyPair();
+        String registeredPublicKey = Base64.getEncoder()
+                .encodeToString(registeredKeyPair.getPublic().getEncoded());
+        registry.put("alice", registeredPublicKey);
+
+        try (HandlerSession session = HandlerSession.open(registry)) {
+            byte[] nonce = Base64.getDecoder().decode(
+                    assertChallenge(session.client.receive()));
+            session.client.send(createAuth("alice",
+                    signNonce(nonce, attackerKeyPair),
+                    Base64.getEncoder().encodeToString(
+                            attackerKeyPair.getPublic().getEncoded())));
+            assertError(session.client.receive(), "AUTH_FAILED");
+            TestSupport.assertThrows(IOException.class, session.client::receive);
+        }
+        TestSupport.assertEquals(registeredPublicKey, registry.get("alice"));
+    }
+
     private static String assertChallenge(Envelope challenge) {
         TestSupport.assertEquals(Opcode.AUTH_CHALLENGE, challenge.getOp());
         TestSupport.assertEquals("server", challenge.getFrom());
@@ -279,12 +331,18 @@ public final class ServerIssue8AcceptanceTest {
         }
 
         private static HandlerSession open() throws Exception {
+            return open(new ConcurrentHashMap<>());
+        }
+
+        private static HandlerSession open(
+                ConcurrentMap<String, String> publicKeyRegistry) throws Exception {
             ServerSocket serverSocket = new ServerSocket(
                     0, 1, InetAddress.getByName(HOST));
             AtomicReference<Throwable> handlerFailure = new AtomicReference<>();
             Thread handlerThread = new Thread(() -> {
                 try {
-                    new ClientHandler(serverSocket.accept()).run();
+                    new ClientHandler(serverSocket.accept(), () -> {
+                    }, publicKeyRegistry).run();
                 } catch (Throwable t) {
                     handlerFailure.set(t);
                 }

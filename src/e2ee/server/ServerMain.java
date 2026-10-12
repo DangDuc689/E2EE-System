@@ -9,6 +9,7 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadPoolExecutor;
@@ -32,6 +33,7 @@ public class ServerMain {
     private final Object lifecycleLock = new Object();
     private final AtomicBoolean shuttingDown = new AtomicBoolean(false);
     private final Set<Socket> activeClients = ConcurrentHashMap.newKeySet();
+    private final ConcurrentMap<String, String> publicKeyRegistry = new ConcurrentHashMap<>();
     private final ThreadPoolExecutor clientExecutor;
 
     private volatile ServerSocket serverSocket;
@@ -90,7 +92,8 @@ public class ServerMain {
                 try {
                     clientExecutor.submit(new ClientHandler(
                             clientSocket,
-                            () -> activeClients.remove(clientSocket)));
+                            () -> activeClients.remove(clientSocket),
+                            publicKeyRegistry));
                 } catch (RejectedExecutionException e) {
                     try {
                         rejectClient(clientSocket);

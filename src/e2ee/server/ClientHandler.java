@@ -18,6 +18,8 @@ import java.security.Signature;
 import java.security.spec.X509EncodedKeySpec;
 import java.util.Arrays;
 import java.util.Base64;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.regex.Pattern;
 
 final class ClientHandler implements Runnable {
@@ -28,18 +30,25 @@ final class ClientHandler implements Runnable {
 
     private final Socket clientSocket;
     private final Runnable onClose;
+    private final ConcurrentMap<String, String> publicKeyRegistry;
     private byte[] challengeNonce;
     private boolean authenticated;
     private String authenticatedUsername;
 
     ClientHandler(Socket clientSocket) {
         this(clientSocket, () -> {
-        });
+        }, new ConcurrentHashMap<>());
     }
 
     ClientHandler(Socket clientSocket, Runnable onClose) {
+        this(clientSocket, onClose, new ConcurrentHashMap<>());
+    }
+
+    ClientHandler(Socket clientSocket, Runnable onClose,
+            ConcurrentMap<String, String> publicKeyRegistry) {
         this.clientSocket = clientSocket;
         this.onClose = onClose;
+        this.publicKeyRegistry = publicKeyRegistry;
     }
 
     @Override
@@ -146,7 +155,8 @@ final class ClientHandler implements Runnable {
                 || !(publicKeyValue instanceof String publicKeyBase64)
                 || signatureBase64.isBlank()
                 || publicKeyBase64.isBlank()
-                || !verifyAuthSignature(signatureBase64, publicKeyBase64)) {
+                || !authenticateWithRegisteredKey(
+                        username, signatureBase64, publicKeyBase64)) {
             destroyChallengeNonce();
             sendError(channel, username, "AUTH_FAILED", "Authentication failed");
             return false;
@@ -160,6 +170,25 @@ final class ClientHandler implements Runnable {
                 .put("msg", "Authenticated successfully");
         channel.send(authOk);
         return true;
+    }
+
+    private boolean authenticateWithRegisteredKey(String username,
+            String signatureBase64, String suppliedPublicKeyBase64) {
+        String registeredPublicKey = publicKeyRegistry.get(username);
+        if (registeredPublicKey != null) {
+            return verifyAuthSignature(signatureBase64, registeredPublicKey);
+        }
+
+        // TOFU: chỉ ghim khóa sau khi chính khóa đó xác thực được challenge.
+        if (!verifyAuthSignature(signatureBase64, suppliedPublicKeyBase64)) {
+            return false;
+        }
+
+        String concurrentlyRegisteredKey = publicKeyRegistry.putIfAbsent(
+                username, suppliedPublicKeyBase64);
+        return concurrentlyRegisteredKey == null
+                || concurrentlyRegisteredKey.equals(suppliedPublicKeyBase64)
+                || verifyAuthSignature(signatureBase64, concurrentlyRegisteredKey);
     }
 
     private boolean verifyAuthSignature(String signatureBase64, String publicKeyBase64) {

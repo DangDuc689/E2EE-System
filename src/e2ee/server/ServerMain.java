@@ -34,6 +34,8 @@ public class ServerMain {
     private final AtomicBoolean shuttingDown = new AtomicBoolean(false);
     private final Set<Socket> activeClients = ConcurrentHashMap.newKeySet();
     private final ConcurrentMap<String, String> publicKeyRegistry = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, ClientHandler> onlineUsers = new ConcurrentHashMap<>();
+    private final PresenceDispatcher presenceDispatcher = new PresenceDispatcher(onlineUsers);
     private final ThreadPoolExecutor clientExecutor;
 
     private volatile ServerSocket serverSocket;
@@ -93,7 +95,17 @@ public class ServerMain {
                     clientExecutor.submit(new ClientHandler(
                             clientSocket,
                             () -> activeClients.remove(clientSocket),
-                            publicKeyRegistry));
+                            publicKeyRegistry,
+                            onlineUsers,
+                            presenceDispatcher,
+                            () -> {
+                            },
+                            () -> {
+                            },
+                            () -> {
+                            },
+                            () -> {
+                            }));
                 } catch (RejectedExecutionException e) {
                     try {
                         rejectClient(clientSocket);
@@ -131,6 +143,7 @@ public class ServerMain {
             closeServerSocket();
         }
         activeClients.forEach(ServerMain::closeSocket);
+        presenceDispatcher.shutdown();
         clientExecutor.shutdown();
 
         try {

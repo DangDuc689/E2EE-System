@@ -31,24 +31,67 @@ final class ClientHandler implements Runnable {
     private final Socket clientSocket;
     private final Runnable onClose;
     private final ConcurrentMap<String, String> publicKeyRegistry;
+    private final ConcurrentMap<String, ClientHandler> onlineUsers;
+    private final PresenceDispatcher presenceDispatcher;
+    private final Runnable afterOwnershipCheck;
+    private final Runnable beforeRequestDispatch;
+    private final Runnable beforePresenceSnapshot;
+    private final Runnable beforePresenceWrite;
+    private final Object dispatchLock = new Object();
+    private boolean dispatchAllowed = true;
+    private int activeDispatches;
     private byte[] challengeNonce;
     private boolean authenticated;
     private String authenticatedUsername;
+    private volatile SocketPacketChannel presenceChannel;
 
     ClientHandler(Socket clientSocket) {
         this(clientSocket, () -> {
-        }, new ConcurrentHashMap<>());
+        }, new ConcurrentHashMap<>(), new ConcurrentHashMap<>(), null, () -> {
+        }, () -> {
+        }, () -> {
+        }, () -> {
+        });
     }
 
     ClientHandler(Socket clientSocket, Runnable onClose) {
-        this(clientSocket, onClose, new ConcurrentHashMap<>());
+        this(clientSocket, onClose, new ConcurrentHashMap<>(), new ConcurrentHashMap<>(), null,
+                () -> {
+                }, () -> {
+                }, () -> {
+                }, () -> {
+                });
     }
 
     ClientHandler(Socket clientSocket, Runnable onClose,
-            ConcurrentMap<String, String> publicKeyRegistry) {
+            ConcurrentMap<String, String> publicKeyRegistry,
+            ConcurrentMap<String, ClientHandler> onlineUsers) {
+        this(clientSocket, onClose, publicKeyRegistry, onlineUsers,
+                new PresenceDispatcher(onlineUsers), () -> {
+        }, () -> {
+        }, () -> {
+        }, () -> {
+        });
+    }
+
+    ClientHandler(Socket clientSocket, Runnable onClose,
+            ConcurrentMap<String, String> publicKeyRegistry,
+            ConcurrentMap<String, ClientHandler> onlineUsers,
+            PresenceDispatcher presenceDispatcher,
+            Runnable afterOwnershipCheck,
+            Runnable beforeRequestDispatch,
+            Runnable beforePresenceSnapshot,
+            Runnable beforePresenceWrite) {
         this.clientSocket = clientSocket;
         this.onClose = onClose;
         this.publicKeyRegistry = publicKeyRegistry;
+        this.onlineUsers = onlineUsers;
+        this.presenceDispatcher = presenceDispatcher == null
+                ? new PresenceDispatcher(onlineUsers) : presenceDispatcher;
+        this.afterOwnershipCheck = afterOwnershipCheck;
+        this.beforeRequestDispatch = beforeRequestDispatch;
+        this.beforePresenceSnapshot = beforePresenceSnapshot;
+        this.beforePresenceWrite = beforePresenceWrite;
     }
 
     @Override
@@ -63,6 +106,7 @@ final class ClientHandler implements Runnable {
 
         try (Socket socket = clientSocket;
                 SocketPacketChannel channel = new SocketPacketChannel(socket)) {
+            presenceChannel = channel;
             sendAuthChallenge(channel);
             socket.setSoTimeout(CLIENT_TIMEOUT_MS);
             System.out.println("[E2EE-SERVER] Client da ket noi: "
@@ -79,6 +123,11 @@ final class ClientHandler implements Runnable {
                 Envelope envelope = channel.receive();
                 logEnvelopeMetadata(envelope);
 
+                if (authenticated
+                        && onlineUsers.get(authenticatedUsername) != this) {
+                    break;
+                }
+
                 if (!authenticated) {
                     if (envelope.getOp() != Opcode.AUTH) {
                         sendError(channel, envelope.getFrom(),
@@ -91,6 +140,11 @@ final class ClientHandler implements Runnable {
                     continue;
                 }
 
+                afterOwnershipCheck.run();
+                if (!beginRequestDispatch()) {
+                    break;
+                }
+
                 /*
                  * ===================================================================
                  * ____ ___ _ _ ____ __ ____ ___ _ _ ____
@@ -100,10 +154,19 @@ final class ClientHandler implements Runnable {
                  * |_| |___|_| \_|\____| /_/ |_| \___/|_| \_|\____|
                  * ===================================================================
                  */
-                if (envelope.getOp() == Opcode.PING) {
-                    Envelope pong = Envelope.create(Opcode.PONG, "server", envelope.getFrom());
-                    pong.setId(envelope.getId());
-                    channel.send(pong);
+                try {
+                    beforeRequestDispatch.run();
+                    if (!isRequestDispatchAllowed()) {
+                        break;
+                    }
+                    if (envelope.getOp() == Opcode.PING) {
+                        Envelope pong = Envelope.create(
+                                Opcode.PONG, "server", envelope.getFrom());
+                        pong.setId(envelope.getId());
+                        channel.send(pong);
+                    }
+                } finally {
+                    endRequestDispatch();
                 }
             }
         } catch (SocketTimeoutException e) {
@@ -119,6 +182,10 @@ final class ClientHandler implements Runnable {
             }
         } finally {
             destroyChallengeNonce();
+            if (authenticatedUsername != null) {
+                presenceDispatcher.disconnect(authenticatedUsername, this);
+            }
+            presenceChannel = null;
             onClose.run();
             System.out.println("[E2EE-SERVER] Da cleanup client: " + clientAddress);
         }
@@ -166,10 +233,85 @@ final class ClientHandler implements Runnable {
         authenticated = true;
         destroyChallengeNonce();
 
+        PresenceDispatcher.Registration registration =
+                presenceDispatcher.register(username, this);
+
         Envelope authOk = Envelope.create(Opcode.AUTH_OK, "server", authenticatedUsername)
                 .put("msg", "Authenticated successfully");
         channel.send(authOk);
+        beforePresenceSnapshot.run();
+        sendPresenceSnapshot(channel, registration.snapshot());
+        presenceDispatcher.activate(username, this);
         return true;
+    }
+
+    private void sendPresenceSnapshot(SocketPacketChannel channel,
+            Iterable<String> snapshot) throws IOException {
+        if (!beginRequestDispatch()) {
+            return;
+        }
+
+        try {
+            for (String onlineUsername : snapshot) {
+                Envelope presence = Envelope.create(
+                        Opcode.PRESENCE, "server", authenticatedUsername)
+                        .put("user", onlineUsername)
+                        .put("online", true);
+                channel.send(presence);
+            }
+        } finally {
+            endRequestDispatch();
+        }
+    }
+
+    private boolean beginRequestDispatch() {
+        synchronized (dispatchLock) {
+            if (!dispatchAllowed) {
+                return false;
+            }
+            activeDispatches++;
+            return true;
+        }
+    }
+
+    private void endRequestDispatch() {
+        synchronized (dispatchLock) {
+            activeDispatches--;
+        }
+    }
+
+    private boolean isRequestDispatchAllowed() {
+        synchronized (dispatchLock) {
+            return dispatchAllowed;
+        }
+    }
+
+    void revokeRequestDispatch() {
+        synchronized (dispatchLock) {
+            dispatchAllowed = false;
+        }
+    }
+
+    void closeReplacedSession() {
+        try {
+            clientSocket.close();
+        } catch (IOException e) {
+            System.err.println("[E2EE-SERVER] Loi khi dong session bi thay the: "
+                    + clientSocket.getRemoteSocketAddress());
+        }
+    }
+
+    void sendPresence(Envelope presence) throws IOException {
+        beforePresenceWrite.run();
+        SocketPacketChannel channel = presenceChannel;
+        if (channel == null) {
+            throw new IOException("Presence channel is closed");
+        }
+        channel.send(presence);
+    }
+
+    void closePresenceSession() {
+        closeReplacedSession();
     }
 
     private boolean authenticateWithRegisteredKey(String username,

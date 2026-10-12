@@ -10,7 +10,13 @@ import java.io.IOException;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
+import java.security.GeneralSecurityException;
+import java.security.KeyFactory;
+import java.security.PublicKey;
 import java.security.SecureRandom;
+import java.security.Signature;
+import java.security.spec.X509EncodedKeySpec;
+import java.util.Arrays;
 import java.util.Base64;
 import java.util.regex.Pattern;
 
@@ -23,6 +29,8 @@ final class ClientHandler implements Runnable {
     private final Socket clientSocket;
     private final Runnable onClose;
     private byte[] challengeNonce;
+    private boolean authenticated;
+    private String authenticatedUsername;
 
     ClientHandler(Socket clientSocket) {
         this(clientSocket, () -> {
@@ -62,6 +70,18 @@ final class ClientHandler implements Runnable {
                 Envelope envelope = channel.receive();
                 logEnvelopeMetadata(envelope);
 
+                if (!authenticated) {
+                    if (envelope.getOp() != Opcode.AUTH) {
+                        sendError(channel, envelope.getFrom(),
+                                "UNAUTHENTICATED", "Authentication is required");
+                        continue;
+                    }
+                    if (!authenticate(envelope, channel)) {
+                        break;
+                    }
+                    continue;
+                }
+
                 /*
                  * ===================================================================
                  * ____ ___ _ _ ____ __ ____ ___ _ _ ____
@@ -89,6 +109,7 @@ final class ClientHandler implements Runnable {
                         + clientAddress + " - " + e.getMessage());
             }
         } finally {
+            destroyChallengeNonce();
             onClose.run();
             System.out.println("[E2EE-SERVER] Da cleanup client: " + clientAddress);
         }
@@ -108,6 +129,72 @@ final class ClientHandler implements Runnable {
         Envelope challenge = Envelope.create(Opcode.AUTH_CHALLENGE, "server", null)
                 .put("nonce", Base64.getEncoder().encodeToString(challengeNonce));
         channel.send(challenge);
+    }
+
+    private boolean authenticate(Envelope envelope, SocketPacketChannel channel)
+            throws IOException {
+        String username = envelope.getFrom();
+        if (!isValidUsername(username)) {
+            destroyChallengeNonce();
+            sendError(channel, username, "INVALID_USERNAME", "Invalid username");
+            return false;
+        }
+
+        Object signatureValue = envelope.get("sig");
+        Object publicKeyValue = envelope.get("pubkey");
+        if (!(signatureValue instanceof String signatureBase64)
+                || !(publicKeyValue instanceof String publicKeyBase64)
+                || signatureBase64.isBlank()
+                || publicKeyBase64.isBlank()
+                || !verifyAuthSignature(signatureBase64, publicKeyBase64)) {
+            destroyChallengeNonce();
+            sendError(channel, username, "AUTH_FAILED", "Authentication failed");
+            return false;
+        }
+
+        authenticatedUsername = username;
+        authenticated = true;
+        destroyChallengeNonce();
+
+        Envelope authOk = Envelope.create(Opcode.AUTH_OK, "server", authenticatedUsername)
+                .put("msg", "Authenticated successfully");
+        channel.send(authOk);
+        return true;
+    }
+
+    private boolean verifyAuthSignature(String signatureBase64, String publicKeyBase64) {
+        if (challengeNonce == null) {
+            return false;
+        }
+
+        try {
+            byte[] signatureBytes = Base64.getDecoder().decode(signatureBase64);
+            byte[] publicKeyBytes = Base64.getDecoder().decode(publicKeyBase64);
+            PublicKey publicKey = KeyFactory.getInstance("RSA")
+                    .generatePublic(new X509EncodedKeySpec(publicKeyBytes));
+
+            Signature verifier = Signature.getInstance("SHA256withRSA");
+            verifier.initVerify(publicKey);
+            verifier.update(challengeNonce);
+            return verifier.verify(signatureBytes);
+        } catch (GeneralSecurityException | IllegalArgumentException e) {
+            return false;
+        }
+    }
+
+    private void destroyChallengeNonce() {
+        if (challengeNonce != null) {
+            Arrays.fill(challengeNonce, (byte) 0);
+            challengeNonce = null;
+        }
+    }
+
+    private static void sendError(SocketPacketChannel channel, String to,
+            String code, String message) throws IOException {
+        Envelope error = Envelope.create(Opcode.ERROR, "server", to)
+                .put("code", code)
+                .put("msg", message);
+        channel.send(error);
     }
 
     private static void logEnvelopeMetadata(Envelope envelope) {

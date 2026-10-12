@@ -91,6 +91,18 @@ public final class ServerIssue8AcceptanceTest {
                 ServerIssue8AcceptanceTest::testSlowClientIsolationAndOverflow);
         TestSupport.check("Presence writer shutdown best-effort",
                 ServerIssue8AcceptanceTest::testPresenceShutdownBestEffort);
+        TestSupport.check("KEY_PUBLISH truoc AUTH bi chan",
+                ServerIssue8AcceptanceTest::testUnauthenticatedKeyPublish);
+        TestSupport.check("KEY_PUBLISH cap nhat registry va broadcast KEY_CHANGED",
+                ServerIssue8AcceptanceTest::testKeyPublishUpdatesRegistryAndBroadcasts);
+        TestSupport.check("KEY_PUBLISH tu choi public key khong phai RSA X.509",
+                ServerIssue8AcceptanceTest::testInvalidPublishedKeyIsIgnored);
+        TestSupport.check("Session bi thay the khong duoc KEY_PUBLISH",
+                ServerIssue8AcceptanceTest::testReplacedSessionCannotPublishKey);
+        TestSupport.check("TOFU dung public key moi sau KEY_PUBLISH",
+                ServerIssue8AcceptanceTest::testTofuUsesPublishedKey);
+        TestSupport.check("KEY_CHANGED khong gui khoa cu sau khoa moi",
+                ServerIssue8AcceptanceTest::testStaleKeyChangedIsNotSentAfterNewKey);
                 TestSupport.summary();
         }
 
@@ -858,6 +870,193 @@ public final class ServerIssue8AcceptanceTest {
         }
     }
 
+    private static void testUnauthenticatedKeyPublish() throws Exception {
+        try (HandlerSession session = HandlerSession.open()) {
+            assertChallenge(session.client.receive());
+            String publicKey = Base64.getEncoder().encodeToString(
+                    generateRsaKeyPair().getPublic().getEncoded());
+            session.client.send(Envelope.create(
+                    Opcode.KEY_PUBLISH, "alice", "server")
+                    .put("pubkey", publicKey));
+
+            assertError(session.client.receive(), "UNAUTHENTICATED");
+        }
+    }
+
+    private static void testKeyPublishUpdatesRegistryAndBroadcasts() throws Exception {
+        ConcurrentMap<String, String> keyRegistry = new ConcurrentHashMap<>();
+        ConcurrentMap<String, ClientHandler> onlineUsers = new ConcurrentHashMap<>();
+        KeyPair aliceKey = generateRsaKeyPair();
+        KeyPair bobKey = generateRsaKeyPair();
+        String newAlicePublicKey = Base64.getEncoder().encodeToString(
+                generateRsaKeyPair().getPublic().getEncoded());
+
+        try (HandlerSession alice = HandlerSession.open(keyRegistry, onlineUsers);
+                HandlerSession bob = HandlerSession.open(keyRegistry, onlineUsers)) {
+            authenticate(alice, "alice", aliceKey);
+            authenticate(bob, "bob", bobKey);
+            assertPresence(bob.client.receive(), "bob", "alice");
+            assertPresence(alice.client.receive(), "alice", "bob");
+
+            alice.client.send(Envelope.create(
+                    Opcode.KEY_PUBLISH, "mallory", "server")
+                    .put("pubkey", newAlicePublicKey));
+
+            assertKeyChanged(alice.client.receive(), "alice", "alice",
+                    newAlicePublicKey);
+            assertKeyChanged(bob.client.receive(), "alice", "bob",
+                    newAlicePublicKey);
+            TestSupport.assertEquals(newAlicePublicKey, keyRegistry.get("alice"));
+            TestSupport.assertTrue(!keyRegistry.containsKey("mallory"),
+                    "Server khong duoc tin envelope.from cua KEY_PUBLISH");
+        }
+    }
+
+    private static void testInvalidPublishedKeyIsIgnored() throws Exception {
+        ConcurrentMap<String, String> keyRegistry = new ConcurrentHashMap<>();
+        ConcurrentMap<String, ClientHandler> onlineUsers = new ConcurrentHashMap<>();
+        KeyPair aliceKey = generateRsaKeyPair();
+
+        try (HandlerSession alice = HandlerSession.open(keyRegistry, onlineUsers)) {
+            authenticate(alice, "alice", aliceKey);
+            String originalPublicKey = keyRegistry.get("alice");
+            KeyPairGenerator ecGenerator = KeyPairGenerator.getInstance("EC");
+            ecGenerator.initialize(256);
+            String ecPublicKey = Base64.getEncoder().encodeToString(
+                    ecGenerator.generateKeyPair().getPublic().getEncoded());
+
+            alice.client.send(Envelope.create(
+                    Opcode.KEY_PUBLISH, "alice", "server")
+                    .put("pubkey", ecPublicKey));
+            assertPingPong(alice, "invalid-published-key");
+
+            TestSupport.assertEquals(originalPublicKey, keyRegistry.get("alice"));
+        }
+    }
+
+    private static void testReplacedSessionCannotPublishKey() throws Exception {
+        ConcurrentMap<String, String> keyRegistry = new ConcurrentHashMap<>();
+        ConcurrentMap<String, ClientHandler> onlineUsers = new ConcurrentHashMap<>();
+        KeyPair trustedKey = generateRsaKeyPair();
+        String trustedPublicKey = Base64.getEncoder().encodeToString(
+                trustedKey.getPublic().getEncoded());
+        String replacementKey = Base64.getEncoder().encodeToString(
+                generateRsaKeyPair().getPublic().getEncoded());
+        CountDownLatch dispatchReached = new CountDownLatch(1);
+        CountDownLatch releaseDispatch = new CountDownLatch(1);
+
+        try (HandlerSession oldSession = HandlerSession.open(
+                keyRegistry, onlineUsers, () -> {
+                }, () -> {
+                    dispatchReached.countDown();
+                    awaitLatch(releaseDispatch);
+                });
+                HandlerSession newSession = HandlerSession.open(keyRegistry, onlineUsers)) {
+            authenticate(oldSession, "alice", trustedKey);
+            oldSession.client.send(Envelope.create(
+                    Opcode.KEY_PUBLISH, "alice", "server")
+                    .put("pubkey", replacementKey));
+            TestSupport.assertTrue(dispatchReached.await(5, TimeUnit.SECONDS),
+                    "Session cu phai vao dispatch truoc replacement");
+
+            authenticate(newSession, "alice", trustedKey);
+            releaseDispatch.countDown();
+            waitUntil(() -> onlineUsers.get("alice") == newSession.handler(),
+                    "Session moi phai giu ownership");
+
+            TestSupport.assertEquals(trustedPublicKey, keyRegistry.get("alice"));
+            assertPingPong(newSession, "new-session-after-replacement");
+        } finally {
+            releaseDispatch.countDown();
+        }
+    }
+
+    private static void testTofuUsesPublishedKey() throws Exception {
+        ConcurrentMap<String, String> keyRegistry = new ConcurrentHashMap<>();
+        ConcurrentMap<String, ClientHandler> onlineUsers = new ConcurrentHashMap<>();
+        KeyPair oldKey = generateRsaKeyPair();
+        KeyPair newKey = generateRsaKeyPair();
+        String newPublicKey = Base64.getEncoder().encodeToString(
+                newKey.getPublic().getEncoded());
+
+        try (HandlerSession first = HandlerSession.open(keyRegistry, onlineUsers)) {
+            authenticate(first, "alice", oldKey);
+            first.client.send(Envelope.create(
+                    Opcode.KEY_PUBLISH, "alice", "server")
+                    .put("pubkey", newPublicKey));
+            assertKeyChanged(first.client.receive(), "alice", "alice", newPublicKey);
+        }
+        waitUntil(() -> !onlineUsers.containsKey("alice"),
+                "Session dau phai cleanup truoc lan AUTH tiep theo");
+
+        try (HandlerSession stale = HandlerSession.open(keyRegistry, onlineUsers)) {
+            byte[] nonce = Base64.getDecoder().decode(
+                    assertChallenge(stale.client.receive()));
+            stale.client.send(createAuth("alice", signNonce(nonce, oldKey),
+                    Base64.getEncoder().encodeToString(oldKey.getPublic().getEncoded())));
+            assertError(stale.client.receive(), "AUTH_FAILED");
+        }
+
+        try (HandlerSession current = HandlerSession.open(keyRegistry, onlineUsers)) {
+            authenticate(current, "alice", newKey);
+            assertPingPong(current, "published-key-auth");
+        }
+    }
+
+    private static void testStaleKeyChangedIsNotSentAfterNewKey() throws Exception {
+        ConcurrentMap<String, String> keyRegistry = new ConcurrentHashMap<>();
+        ConcurrentMap<String, ClientHandler> onlineUsers = new ConcurrentHashMap<>();
+        KeyPair observerKey = generateRsaKeyPair();
+        KeyPair initialKey = generateRsaKeyPair();
+        KeyPair firstPublishedKey = generateRsaKeyPair();
+        KeyPair secondPublishedKey = generateRsaKeyPair();
+        String firstPublicKey = Base64.getEncoder().encodeToString(
+                firstPublishedKey.getPublic().getEncoded());
+        String secondPublicKey = Base64.getEncoder().encodeToString(
+                secondPublishedKey.getPublic().getEncoded());
+        CountDownLatch firstKeyUpdated = new CountDownLatch(1);
+        CountDownLatch releaseFirstBroadcast = new CountDownLatch(1);
+
+        try (HandlerSession observer = HandlerSession.open(keyRegistry, onlineUsers);
+                HandlerSession first = HandlerSession.open(
+                        keyRegistry, onlineUsers, () -> {
+                            firstKeyUpdated.countDown();
+                            awaitLatch(releaseFirstBroadcast);
+                        });
+                HandlerSession second = HandlerSession.open(keyRegistry, onlineUsers)) {
+            authenticate(observer, "observer", observerKey);
+            authenticate(first, "alice", initialKey);
+            assertPresence(first.client.receive(), "alice", "observer");
+            assertPresence(observer.client.receive(), "observer", "alice");
+
+            first.client.send(Envelope.create(
+                    Opcode.KEY_PUBLISH, "alice", "server")
+                    .put("pubkey", firstPublicKey));
+            TestSupport.assertTrue(firstKeyUpdated.await(5, TimeUnit.SECONDS),
+                    "K1 phai duoc cap nhat truoc khi tam dung broadcast");
+            TestSupport.assertEquals(firstPublicKey, keyRegistry.get("alice"));
+
+            authenticate(second, "alice", firstPublishedKey);
+            assertPresence(second.client.receive(), "alice", "observer");
+            assertPresence(observer.client.receive(), "observer", "alice");
+            second.client.send(Envelope.create(
+                    Opcode.KEY_PUBLISH, "alice", "server")
+                    .put("pubkey", secondPublicKey));
+            assertKeyChanged(second.client.receive(), "alice", "alice",
+                    secondPublicKey);
+            assertKeyChanged(observer.client.receive(), "alice", "observer",
+                    secondPublicKey);
+
+            releaseFirstBroadcast.countDown();
+            waitUntil(() -> !first.handlerThread.isAlive(),
+                    "Session A phai ket thuc sau khi tiep tuc broadcast");
+            assertPingPong(observer, "stale-key-event-filtered");
+            TestSupport.assertEquals(secondPublicKey, keyRegistry.get("alice"));
+        } finally {
+            releaseFirstBroadcast.countDown();
+        }
+    }
+
         private static void awaitLatch(CountDownLatch latch) {
                 boolean interrupted = false;
                 while (true) {
@@ -910,6 +1109,15 @@ public final class ServerIssue8AcceptanceTest {
                         TestSupport.assertEquals(expectedUser, user);
                 }
                 return user;
+        }
+
+        private static void assertKeyChanged(Envelope keyChanged, String owner,
+                        String recipient, String expectedPublicKey) {
+                TestSupport.assertEquals(Opcode.KEY_CHANGED, keyChanged.getOp());
+                TestSupport.assertEquals(owner, keyChanged.getFrom());
+                TestSupport.assertEquals(recipient, keyChanged.getTo());
+                TestSupport.assertEquals(expectedPublicKey,
+                                keyChanged.getString("new_pubkey"));
         }
 
         private static void sendUnchecked(SocketPacketChannel channel, Envelope envelope,
@@ -1023,7 +1231,19 @@ public final class ServerIssue8AcceptanceTest {
                         }, () -> {
                         }, () -> {
                         }, () -> {
-                        });
+                                        });
+                }
+
+                private static HandlerSession open(
+                                ConcurrentMap<String, String> publicKeyRegistry,
+                                ConcurrentMap<String, ClientHandler> onlineUsers,
+                                Runnable beforeKeyChangedBroadcast) throws Exception {
+                        return open(publicKeyRegistry, onlineUsers,
+                                        dispatcherFor(onlineUsers), () -> {
+                                        }, () -> {
+                                        }, () -> {
+                                        }, () -> {
+                                        }, beforeKeyChangedBroadcast);
                 }
 
                 private static HandlerSession open(
@@ -1034,6 +1254,21 @@ public final class ServerIssue8AcceptanceTest {
                                 Runnable beforeRequestDispatch,
                                 Runnable beforePresenceSnapshot,
                                 Runnable beforePresenceWrite) throws Exception {
+                        return open(publicKeyRegistry, onlineUsers, dispatcher,
+                                        afterOwnershipCheck, beforeRequestDispatch,
+                                        beforePresenceSnapshot, beforePresenceWrite, () -> {
+                                        });
+                }
+
+                private static HandlerSession open(
+                                ConcurrentMap<String, String> publicKeyRegistry,
+                                ConcurrentMap<String, ClientHandler> onlineUsers,
+                                PresenceDispatcher presenceDispatcher,
+                                Runnable afterOwnershipCheck,
+                                Runnable beforeRequestDispatch,
+                                Runnable beforePresenceSnapshot,
+                                Runnable beforePresenceWrite,
+                                Runnable beforeKeyChangedBroadcast) throws Exception {
                         ServerSocket serverSocket = new ServerSocket(
                                         0, 1, InetAddress.getByName(HOST));
                         AtomicReference<Throwable> handlerFailure = new AtomicReference<>();
@@ -1042,9 +1277,10 @@ public final class ServerIssue8AcceptanceTest {
                                 try {
                                         ClientHandler handler = new ClientHandler(serverSocket.accept(), () -> {
                                         }, publicKeyRegistry, onlineUsers,
-                                                        dispatcher, afterOwnershipCheck,
+                                                        presenceDispatcher, afterOwnershipCheck,
                                                         beforeRequestDispatch, beforePresenceSnapshot,
-                                                        beforePresenceWrite);
+                                                        beforePresenceWrite,
+                                                        beforeKeyChangedBroadcast);
                                         handlerReference.set(handler);
                                         handler.run();
                                 } catch (Throwable t) {

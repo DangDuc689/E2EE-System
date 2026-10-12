@@ -37,7 +37,9 @@ final class ClientHandler implements Runnable {
     private final Runnable beforeRequestDispatch;
     private final Runnable beforePresenceSnapshot;
     private final Runnable beforePresenceWrite;
+    private final Runnable beforeKeyChangedBroadcast;
     private final Object dispatchLock = new Object();
+    private final Object keyChangedSendLock = new Object();
     private boolean dispatchAllowed = true;
     private int activeDispatches;
     private byte[] challengeNonce;
@@ -82,6 +84,21 @@ final class ClientHandler implements Runnable {
             Runnable beforeRequestDispatch,
             Runnable beforePresenceSnapshot,
             Runnable beforePresenceWrite) {
+        this(clientSocket, onClose, publicKeyRegistry, onlineUsers,
+                presenceDispatcher, afterOwnershipCheck, beforeRequestDispatch,
+                beforePresenceSnapshot, beforePresenceWrite, () -> {
+                });
+    }
+
+    ClientHandler(Socket clientSocket, Runnable onClose,
+            ConcurrentMap<String, String> publicKeyRegistry,
+            ConcurrentMap<String, ClientHandler> onlineUsers,
+            PresenceDispatcher presenceDispatcher,
+            Runnable afterOwnershipCheck,
+            Runnable beforeRequestDispatch,
+            Runnable beforePresenceSnapshot,
+            Runnable beforePresenceWrite,
+            Runnable beforeKeyChangedBroadcast) {
         this.clientSocket = clientSocket;
         this.onClose = onClose;
         this.publicKeyRegistry = publicKeyRegistry;
@@ -92,6 +109,7 @@ final class ClientHandler implements Runnable {
         this.beforeRequestDispatch = beforeRequestDispatch;
         this.beforePresenceSnapshot = beforePresenceSnapshot;
         this.beforePresenceWrite = beforePresenceWrite;
+        this.beforeKeyChangedBroadcast = beforeKeyChangedBroadcast;
     }
 
     @Override
@@ -164,6 +182,8 @@ final class ClientHandler implements Runnable {
                                 Opcode.PONG, "server", envelope.getFrom());
                         pong.setId(envelope.getId());
                         channel.send(pong);
+                    } else if (envelope.getOp() == Opcode.KEY_PUBLISH) {
+                        handleKeyPublish(envelope);
                     }
                 } finally {
                     endRequestDispatch();
@@ -312,6 +332,83 @@ final class ClientHandler implements Runnable {
 
     void closePresenceSession() {
         closeReplacedSession();
+    }
+
+    private void handleKeyPublish(Envelope envelope) {
+        Object publicKeyValue = envelope.get("pubkey");
+        if (!(publicKeyValue instanceof String publicKeyBase64)
+                || publicKeyBase64.isBlank()
+                || !isValidRsaPublicKey(publicKeyBase64)
+                || !replacePublishedKey(publicKeyBase64)) {
+            return;
+        }
+
+        beforeKeyChangedBroadcast.run();
+        broadcastKeyChanged(publicKeyBase64);
+    }
+
+    private boolean replacePublishedKey(String publicKeyBase64) {
+        synchronized (dispatchLock) {
+            if (!dispatchAllowed
+                    || onlineUsers.get(authenticatedUsername) != this) {
+                return false;
+            }
+            publicKeyRegistry.put(authenticatedUsername, publicKeyBase64);
+            return true;
+        }
+    }
+
+    private void broadcastKeyChanged(String publicKeyBase64) {
+        for (String onlineUsername : onlineUsers.keySet()) {
+            ClientHandler recipient = onlineUsers.get(onlineUsername);
+            if (recipient == null) {
+                continue;
+            }
+
+            Envelope keyChanged = Envelope.create(
+                    Opcode.KEY_CHANGED, authenticatedUsername, onlineUsername)
+                    .put("new_pubkey", publicKeyBase64);
+            try {
+                recipient.sendKeyChangedIfCurrent(onlineUsername,
+                        authenticatedUsername, publicKeyBase64, keyChanged);
+            } catch (IOException e) {
+                recipient.closePresenceSession();
+            }
+        }
+    }
+
+    private void sendKeyChangedIfCurrent(String expectedUsername,
+            String keyOwner, String expectedPublicKey,
+            Envelope keyChanged) throws IOException {
+        synchronized (keyChangedSendLock) {
+            if (!isCurrentOnlineSession(expectedUsername)
+                    || !expectedPublicKey.equals(publicKeyRegistry.get(keyOwner))) {
+                return;
+            }
+
+            SocketPacketChannel channel = presenceChannel;
+            if (channel == null) {
+                throw new IOException("Session channel is closed");
+            }
+            channel.send(keyChanged);
+        }
+    }
+
+    private boolean isCurrentOnlineSession(String expectedUsername) {
+        synchronized (dispatchLock) {
+            return dispatchAllowed && onlineUsers.get(expectedUsername) == this;
+        }
+    }
+
+    private static boolean isValidRsaPublicKey(String publicKeyBase64) {
+        try {
+            byte[] publicKeyBytes = Base64.getDecoder().decode(publicKeyBase64);
+            PublicKey publicKey = KeyFactory.getInstance("RSA")
+                    .generatePublic(new X509EncodedKeySpec(publicKeyBytes));
+            return "RSA".equals(publicKey.getAlgorithm());
+        } catch (GeneralSecurityException | IllegalArgumentException e) {
+            return false;
+        }
     }
 
     private boolean authenticateWithRegisteredKey(String username,

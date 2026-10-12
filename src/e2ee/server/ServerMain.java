@@ -36,6 +36,8 @@ public class ServerMain {
     private final ConcurrentMap<String, String> publicKeyRegistry = new ConcurrentHashMap<>();
     private final ConcurrentMap<String, ClientHandler> onlineUsers = new ConcurrentHashMap<>();
     private final PresenceDispatcher presenceDispatcher = new PresenceDispatcher(onlineUsers);
+    private final MessageRouter messageRouter =
+            new Default1to1Router(onlineUsers, publicKeyRegistry);
     private final ThreadPoolExecutor clientExecutor;
 
     private volatile ServerSocket serverSocket;
@@ -98,6 +100,7 @@ public class ServerMain {
                             publicKeyRegistry,
                             onlineUsers,
                             presenceDispatcher,
+                            messageRouter,
                             () -> {
                             },
                             () -> {

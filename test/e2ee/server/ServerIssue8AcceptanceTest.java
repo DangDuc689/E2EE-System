@@ -27,6 +27,7 @@ import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 
@@ -103,6 +104,24 @@ public final class ServerIssue8AcceptanceTest {
                 ServerIssue8AcceptanceTest::testTofuUsesPublishedKey);
         TestSupport.check("KEY_CHANGED khong gui khoa cu sau khoa moi",
                 ServerIssue8AcceptanceTest::testStaleKeyChangedIsNotSentAfterNewKey);
+        TestSupport.check("CHAT_1TO1 relay nguyen ven va chong gia mao from",
+                ServerIssue8AcceptanceTest::testChatRelayPreservesEnvelopeAndNormalizesSender);
+        TestSupport.check("CHAT_1TO1 toi recipient offline",
+                ServerIssue8AcceptanceTest::testChatToOfflineRecipient);
+        TestSupport.check("KEY_LOOKUP tim thay public key",
+                ServerIssue8AcceptanceTest::testKeyLookupFound);
+        TestSupport.check("KEY_LOOKUP khong tim thay public key",
+                ServerIssue8AcceptanceTest::testKeyLookupNotFound);
+        TestSupport.check("KEY_LOOKUP tra public key moi sau KEY_PUBLISH",
+                ServerIssue8AcceptanceTest::testKeyLookupUsesPublishedKey);
+        TestSupport.check("Route request truoc AUTH bi chan",
+                ServerIssue8AcceptanceTest::testUnauthenticatedRouteRequests);
+        TestSupport.check("Session cu khong route sau replacement",
+                ServerIssue8AcceptanceTest::testReplacedSessionCannotRoute);
+        TestSupport.check("Relay dung session recipient moi sau reconnect",
+                ServerIssue8AcceptanceTest::testRelayUsesReconnectedRecipient);
+        TestSupport.check("CHAT_1TO1 khong retry sau IOException",
+                ServerIssue8AcceptanceTest::testChatIOExceptionDoesNotRetry);
                 TestSupport.summary();
         }
 
@@ -1057,6 +1076,254 @@ public final class ServerIssue8AcceptanceTest {
         }
     }
 
+    private static void testChatRelayPreservesEnvelopeAndNormalizesSender()
+            throws Exception {
+        ConcurrentMap<String, String> keyRegistry = new ConcurrentHashMap<>();
+        ConcurrentMap<String, ClientHandler> onlineUsers = new ConcurrentHashMap<>();
+
+        try (HandlerSession alice = HandlerSession.open(keyRegistry, onlineUsers);
+                HandlerSession bob = HandlerSession.open(keyRegistry, onlineUsers)) {
+            authenticate(alice, "alice", generateRsaKeyPair());
+            authenticate(bob, "bob", generateRsaKeyPair());
+            assertPresence(bob.client.receive(), "bob", "alice");
+            assertPresence(alice.client.receive(), "alice", "bob");
+
+            Envelope chat = Envelope.create(Opcode.CHAT_1TO1, "mallory", "bob")
+                    .put("ek", "wrapped-key")
+                    .put("iv", "initialization-vector")
+                    .put("ct", "ciphertext")
+                    .put("sig", "signature");
+            chat.setId("chat-preserved-id");
+            chat.setTs(1_711_111_111_111L);
+            Map<String, Object> expectedBody = Map.copyOf(chat.getBody());
+            alice.client.send(chat);
+
+            Envelope relayed = bob.client.receive();
+            TestSupport.assertEquals(Opcode.CHAT_1TO1, relayed.getOp());
+            TestSupport.assertEquals("alice", relayed.getFrom());
+            TestSupport.assertEquals("bob", relayed.getTo());
+            TestSupport.assertEquals("chat-preserved-id", relayed.getId());
+            TestSupport.assertEquals(1_711_111_111_111L, relayed.getTs());
+            TestSupport.assertEquals(expectedBody, relayed.getBody());
+        }
+    }
+
+    private static void testChatToOfflineRecipient() throws Exception {
+        try (HandlerSession alice = HandlerSession.open()) {
+            authenticate(alice, "alice", generateRsaKeyPair());
+            alice.client.send(Envelope.create(
+                    Opcode.CHAT_1TO1, "mallory", "offline_user")
+                    .put("ct", "ciphertext"));
+
+            Envelope error = alice.client.receive();
+            assertError(error, "RECIPIENT_OFFLINE");
+            TestSupport.assertEquals("alice", error.getTo());
+            TestSupport.assertEquals("User is offline", error.getString("msg"));
+        }
+    }
+
+    private static void testKeyLookupFound() throws Exception {
+        ConcurrentMap<String, String> keyRegistry = new ConcurrentHashMap<>();
+        ConcurrentMap<String, ClientHandler> onlineUsers = new ConcurrentHashMap<>();
+        KeyPair bobKey = generateRsaKeyPair();
+        String bobPublicKey = Base64.getEncoder().encodeToString(
+                bobKey.getPublic().getEncoded());
+
+        try (HandlerSession bob = HandlerSession.open(keyRegistry, onlineUsers)) {
+            authenticate(bob, "bob", bobKey);
+        }
+        waitUntil(() -> !onlineUsers.containsKey("bob"),
+                "Bob phai offline truoc KEY_LOOKUP");
+
+        try (HandlerSession alice = HandlerSession.open(keyRegistry, onlineUsers)) {
+            authenticate(alice, "alice", generateRsaKeyPair());
+            alice.client.send(Envelope.create(
+                    Opcode.KEY_LOOKUP, "mallory", "bob"));
+
+            assertKeyLookupResult(
+                    alice.client.receive(), "bob", "alice", bobPublicKey);
+        }
+    }
+
+    private static void testKeyLookupNotFound() throws Exception {
+        try (HandlerSession alice = HandlerSession.open()) {
+            authenticate(alice, "alice", generateRsaKeyPair());
+            alice.client.send(Envelope.create(
+                    Opcode.KEY_LOOKUP, "mallory", "unknown_user"));
+
+            Envelope error = alice.client.receive();
+            assertError(error, "KEY_NOT_FOUND");
+            TestSupport.assertEquals("alice", error.getTo());
+            TestSupport.assertEquals("User not found", error.getString("msg"));
+        }
+    }
+
+    private static void testKeyLookupUsesPublishedKey() throws Exception {
+        ConcurrentMap<String, String> keyRegistry = new ConcurrentHashMap<>();
+        ConcurrentMap<String, ClientHandler> onlineUsers = new ConcurrentHashMap<>();
+        KeyPair newBobKey = generateRsaKeyPair();
+        String newBobPublicKey = Base64.getEncoder().encodeToString(
+                newBobKey.getPublic().getEncoded());
+
+        try (HandlerSession bob = HandlerSession.open(keyRegistry, onlineUsers);
+                HandlerSession alice = HandlerSession.open(keyRegistry, onlineUsers)) {
+            authenticate(bob, "bob", generateRsaKeyPair());
+            authenticate(alice, "alice", generateRsaKeyPair());
+            assertPresence(alice.client.receive(), "alice", "bob");
+            assertPresence(bob.client.receive(), "bob", "alice");
+
+            bob.client.send(Envelope.create(
+                    Opcode.KEY_PUBLISH, "mallory", "server")
+                    .put("pubkey", newBobPublicKey));
+            assertKeyChanged(bob.client.receive(), "bob", "bob", newBobPublicKey);
+            assertKeyChanged(alice.client.receive(), "bob", "alice", newBobPublicKey);
+
+            alice.client.send(Envelope.create(
+                    Opcode.KEY_LOOKUP, "mallory", "bob"));
+            assertKeyLookupResult(
+                    alice.client.receive(), "bob", "alice", newBobPublicKey);
+        }
+    }
+
+    private static void testUnauthenticatedRouteRequests() throws Exception {
+        try (HandlerSession session = HandlerSession.open()) {
+            assertChallenge(session.client.receive());
+            session.client.send(Envelope.create(
+                    Opcode.CHAT_1TO1, "alice", "bob")
+                    .put("ct", "ciphertext"));
+            assertError(session.client.receive(), "UNAUTHENTICATED");
+
+            session.client.send(Envelope.create(
+                    Opcode.KEY_LOOKUP, "alice", "bob"));
+            assertError(session.client.receive(), "UNAUTHENTICATED");
+        }
+    }
+
+    private static void testReplacedSessionCannotRoute() throws Exception {
+        ConcurrentMap<String, String> keyRegistry = new ConcurrentHashMap<>();
+        ConcurrentMap<String, ClientHandler> onlineUsers = new ConcurrentHashMap<>();
+        KeyPair aliceKey = generateRsaKeyPair();
+        CountDownLatch dispatchReached = new CountDownLatch(1);
+        CountDownLatch releaseDispatch = new CountDownLatch(1);
+
+        try (HandlerSession bob = HandlerSession.open(keyRegistry, onlineUsers);
+                HandlerSession oldAlice = HandlerSession.open(
+                        keyRegistry, onlineUsers, () -> {
+                        }, () -> {
+                            dispatchReached.countDown();
+                            awaitLatch(releaseDispatch);
+                        });
+                HandlerSession newAlice = HandlerSession.open(keyRegistry, onlineUsers)) {
+            authenticate(bob, "bob", generateRsaKeyPair());
+            authenticate(oldAlice, "alice", aliceKey);
+            assertPresence(oldAlice.client.receive(), "alice", "bob");
+            assertPresence(bob.client.receive(), "bob", "alice");
+
+            oldAlice.client.send(Envelope.create(
+                    Opcode.CHAT_1TO1, "alice", "bob")
+                    .put("ct", "old-session-message"));
+            TestSupport.assertTrue(dispatchReached.await(5, TimeUnit.SECONDS),
+                    "Session cu phai dung truoc route");
+
+            authenticate(newAlice, "alice", aliceKey);
+            assertPresence(newAlice.client.receive(), "alice", "bob");
+            assertPresence(bob.client.receive(), "bob", "alice");
+            releaseDispatch.countDown();
+            waitUntil(() -> !oldAlice.handlerThread.isAlive(),
+                    "Session cu phai ket thuc sau revoke");
+            assertPingPong(bob, "revoked-route-filtered");
+
+            newAlice.client.send(Envelope.create(
+                    Opcode.CHAT_1TO1, "alice", "bob")
+                    .put("ct", "new-session-message"));
+            Envelope relayed = bob.client.receive();
+            TestSupport.assertEquals(Opcode.CHAT_1TO1, relayed.getOp());
+            TestSupport.assertEquals("new-session-message", relayed.getString("ct"));
+        } finally {
+            releaseDispatch.countDown();
+        }
+    }
+
+    private static void testRelayUsesReconnectedRecipient() throws Exception {
+        ConcurrentMap<String, String> keyRegistry = new ConcurrentHashMap<>();
+        ConcurrentMap<String, ClientHandler> onlineUsers = new ConcurrentHashMap<>();
+        KeyPair bobKey = generateRsaKeyPair();
+        CountDownLatch dispatchReached = new CountDownLatch(1);
+        CountDownLatch releaseDispatch = new CountDownLatch(1);
+        AtomicBoolean pauseOnce = new AtomicBoolean(true);
+
+        try (HandlerSession alice = HandlerSession.open(
+                keyRegistry, onlineUsers, () -> {
+                }, () -> {
+                    if (pauseOnce.compareAndSet(true, false)) {
+                        dispatchReached.countDown();
+                        awaitLatch(releaseDispatch);
+                    }
+                });
+                HandlerSession oldBob = HandlerSession.open(keyRegistry, onlineUsers);
+                HandlerSession newBob = HandlerSession.open(keyRegistry, onlineUsers)) {
+            authenticate(alice, "alice", generateRsaKeyPair());
+            authenticate(oldBob, "bob", bobKey);
+            assertPresence(oldBob.client.receive(), "bob", "alice");
+            assertPresence(alice.client.receive(), "alice", "bob");
+
+            alice.client.send(Envelope.create(
+                    Opcode.CHAT_1TO1, "alice", "bob")
+                    .put("ct", "reconnect-message"));
+            TestSupport.assertTrue(dispatchReached.await(5, TimeUnit.SECONDS),
+                    "Relay phai dung truoc khi tra recipient");
+
+            authenticate(newBob, "bob", bobKey);
+            assertPresence(newBob.client.receive(), "bob", "alice");
+            assertPresence(alice.client.receive(), "alice", "bob");
+            releaseDispatch.countDown();
+
+            Envelope relayed = newBob.client.receive();
+            TestSupport.assertEquals(Opcode.CHAT_1TO1, relayed.getOp());
+            TestSupport.assertEquals("alice", relayed.getFrom());
+            TestSupport.assertEquals("reconnect-message", relayed.getString("ct"));
+        } finally {
+            releaseDispatch.countDown();
+        }
+    }
+
+    private static void testChatIOExceptionDoesNotRetry() throws Exception {
+        ConcurrentMap<String, String> senderKeys = new ConcurrentHashMap<>();
+        ConcurrentMap<String, ClientHandler> senderOnline = new ConcurrentHashMap<>();
+        ConcurrentMap<String, ClientHandler> routerOnline = new ConcurrentHashMap<>();
+        AtomicInteger sendAttempts = new AtomicInteger();
+
+        try (HandlerSession sender = HandlerSession.open(senderKeys, senderOnline);
+                HandlerSession failedRecipient = HandlerSession.open();
+                HandlerSession replacementRecipient = HandlerSession.open()) {
+            authenticate(sender, "alice", generateRsaKeyPair());
+            assertChallenge(failedRecipient.client.receive());
+            assertChallenge(replacementRecipient.client.receive());
+            ClientHandler failedHandler = failedRecipient.handler();
+            ClientHandler replacementHandler = replacementRecipient.handler();
+            routerOnline.put("bob", failedHandler);
+
+            Default1to1Router router = new Default1to1Router(
+                    routerOnline, new ConcurrentHashMap<>(),
+                    (recipient, expectedUsername, envelope) -> {
+                        sendAttempts.incrementAndGet();
+                        TestSupport.assertTrue(recipient == failedHandler,
+                                "Lan gui dau phai dung recipient cu");
+                        routerOnline.put(expectedUsername, replacementHandler);
+                        throw new IOException("Simulated ambiguous socket write");
+                    });
+
+            router.route(Envelope.create(
+                    Opcode.CHAT_1TO1, "alice", "bob")
+                    .put("ct", "ciphertext"), sender.handler());
+
+            TestSupport.assertEquals(1, sendAttempts.get());
+            TestSupport.assertTrue(routerOnline.get("bob") == replacementHandler,
+                    "Mapping phai doi de chung minh router khong retry session moi");
+            assertPingPong(sender, "sender-after-ambiguous-recipient-io");
+        }
+    }
+
         private static void awaitLatch(CountDownLatch latch) {
                 boolean interrupted = false;
                 while (true) {
@@ -1118,6 +1385,16 @@ public final class ServerIssue8AcceptanceTest {
                 TestSupport.assertEquals(recipient, keyChanged.getTo());
                 TestSupport.assertEquals(expectedPublicKey,
                                 keyChanged.getString("new_pubkey"));
+        }
+
+        private static void assertKeyLookupResult(Envelope result, String owner,
+                        String recipient, String expectedPublicKey) {
+                TestSupport.assertEquals(Opcode.KEY_LOOKUP_RESULT, result.getOp());
+                TestSupport.assertEquals(owner, result.getFrom());
+                TestSupport.assertEquals(recipient, result.getTo());
+                TestSupport.assertEquals(1, result.getBody().size());
+                TestSupport.assertEquals(expectedPublicKey,
+                                result.getString("pubkey"));
         }
 
         private static void sendUnchecked(SocketPacketChannel channel, Envelope envelope,

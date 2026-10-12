@@ -33,6 +33,7 @@ final class ClientHandler implements Runnable {
     private final ConcurrentMap<String, String> publicKeyRegistry;
     private final ConcurrentMap<String, ClientHandler> onlineUsers;
     private final PresenceDispatcher presenceDispatcher;
+    private final MessageRouter messageRouter;
     private final Runnable afterOwnershipCheck;
     private final Runnable beforeRequestDispatch;
     private final Runnable beforePresenceSnapshot;
@@ -99,12 +100,47 @@ final class ClientHandler implements Runnable {
             Runnable beforePresenceSnapshot,
             Runnable beforePresenceWrite,
             Runnable beforeKeyChangedBroadcast) {
+        this(clientSocket, onClose, publicKeyRegistry, onlineUsers,
+                presenceDispatcher, afterOwnershipCheck, beforeRequestDispatch,
+                beforePresenceSnapshot, beforePresenceWrite,
+                beforeKeyChangedBroadcast,
+                new Default1to1Router(onlineUsers, publicKeyRegistry));
+    }
+
+    ClientHandler(Socket clientSocket, Runnable onClose,
+            ConcurrentMap<String, String> publicKeyRegistry,
+            ConcurrentMap<String, ClientHandler> onlineUsers,
+            PresenceDispatcher presenceDispatcher,
+            MessageRouter messageRouter,
+            Runnable afterOwnershipCheck,
+            Runnable beforeRequestDispatch,
+            Runnable beforePresenceSnapshot,
+            Runnable beforePresenceWrite) {
+        this(clientSocket, onClose, publicKeyRegistry, onlineUsers,
+                presenceDispatcher, afterOwnershipCheck, beforeRequestDispatch,
+                beforePresenceSnapshot, beforePresenceWrite, () -> {
+                }, messageRouter);
+    }
+
+    private ClientHandler(Socket clientSocket, Runnable onClose,
+            ConcurrentMap<String, String> publicKeyRegistry,
+            ConcurrentMap<String, ClientHandler> onlineUsers,
+            PresenceDispatcher presenceDispatcher,
+            Runnable afterOwnershipCheck,
+            Runnable beforeRequestDispatch,
+            Runnable beforePresenceSnapshot,
+            Runnable beforePresenceWrite,
+            Runnable beforeKeyChangedBroadcast,
+            MessageRouter messageRouter) {
         this.clientSocket = clientSocket;
         this.onClose = onClose;
         this.publicKeyRegistry = publicKeyRegistry;
         this.onlineUsers = onlineUsers;
         this.presenceDispatcher = presenceDispatcher == null
                 ? new PresenceDispatcher(onlineUsers) : presenceDispatcher;
+        this.messageRouter = messageRouter == null
+                ? new Default1to1Router(onlineUsers, publicKeyRegistry)
+                : messageRouter;
         this.afterOwnershipCheck = afterOwnershipCheck;
         this.beforeRequestDispatch = beforeRequestDispatch;
         this.beforePresenceSnapshot = beforePresenceSnapshot;
@@ -184,6 +220,10 @@ final class ClientHandler implements Runnable {
                         channel.send(pong);
                     } else if (envelope.getOp() == Opcode.KEY_PUBLISH) {
                         handleKeyPublish(envelope);
+                    } else if (envelope.getOp() == Opcode.CHAT_1TO1
+                            || envelope.getOp() == Opcode.KEY_LOOKUP) {
+                        envelope.setFrom(authenticatedUsername);
+                        messageRouter.route(envelope, this);
                     }
                 } finally {
                     endRequestDispatch();
@@ -331,6 +371,40 @@ final class ClientHandler implements Runnable {
     }
 
     void closePresenceSession() {
+        closeReplacedSession();
+    }
+
+    String authenticatedUsername() {
+        return authenticatedUsername;
+    }
+
+    void sendRouterEnvelope(Envelope envelope) throws IOException {
+        sendRoutedEnvelopeIfCurrent(authenticatedUsername, envelope);
+    }
+
+    void sendRouterError(String code, String message) throws IOException {
+        Envelope error = Envelope.create(
+                Opcode.ERROR, "server", authenticatedUsername)
+                .put("code", code)
+                .put("msg", message);
+        sendRouterEnvelope(error);
+    }
+
+    boolean sendRoutedEnvelopeIfCurrent(String expectedUsername,
+            Envelope envelope) throws IOException {
+        if (!isCurrentOnlineSession(expectedUsername)) {
+            return false;
+        }
+
+        SocketPacketChannel channel = presenceChannel;
+        if (channel == null) {
+            return false;
+        }
+        channel.send(envelope);
+        return true;
+    }
+
+    void closeRoutedSession() {
         closeReplacedSession();
     }
 

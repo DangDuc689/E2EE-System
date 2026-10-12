@@ -9,7 +9,11 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.security.KeyPair;
+import java.security.KeyPairGenerator;
+import java.security.Signature;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -20,7 +24,8 @@ import java.util.concurrent.TimeUnit;
 public final class ServerIssue7AcceptanceTest {
     private static final String HOST = "127.0.0.1";
     private static final int CONNECT_TIMEOUT_MS = 5_000;
-    private static final int RESPONSE_TIMEOUT_MS = 5_000;
+    private static final int RESPONSE_TIMEOUT_MS = 30_000;
+    private static final int SHUTDOWN_CLOSE_TIMEOUT_MS = 5_000;
     private static final int TIMEOUT_TEST_READ_MS = 100_000;
     private static final long MINIMUM_SERVER_TIMEOUT_MS = 88_000L;
     private static final long MAXIMUM_SERVER_TIMEOUT_MS = 97_000L;
@@ -36,14 +41,15 @@ public final class ServerIssue7AcceptanceTest {
     private static void runAcceptance() throws Exception {
         ServerMain server = new ServerMain();
         Thread serverThread = new Thread(server::run, "issue-7-acceptance-server");
-        List<SocketPacketChannel> acceptedClients = new ArrayList<>();
+        List<AuthenticatedClient> acceptedClients = new ArrayList<>();
 
         serverThread.start();
         try {
             waitForServerStartup(serverThread);
             TestSupport.assertEquals(8888, ServerMain.DEFAULT_PORT);
 
-            SocketPacketChannel firstClient = connectClient(RESPONSE_TIMEOUT_MS);
+            AuthenticatedClient firstClient = connectAuthenticatedClient(
+                    RESPONSE_TIMEOUT_MS, "client000");
             acceptedClients.add(firstClient);
             pass("Server listen port 8888");
 
@@ -59,9 +65,9 @@ public final class ServerIssue7AcceptanceTest {
             assertClientLimitReached();
             pass("Client 51 rejected: MAX_CLIENTS_REACHED");
 
-            SocketPacketChannel releasedClient = acceptedClients.remove(0);
+            AuthenticatedClient releasedClient = acceptedClients.remove(0);
             releasedClient.close();
-            SocketPacketChannel replacement = connectReplacementClient();
+            AuthenticatedClient replacement = connectReplacementClient();
             acceptedClients.add(replacement);
             TestSupport.assertEquals(ServerMain.MAX_CLIENTS, acceptedClients.size());
             pass("Slot reused");
@@ -92,32 +98,34 @@ public final class ServerIssue7AcceptanceTest {
         verifyServerRestart();
     }
 
-    private static List<SocketPacketChannel> connectRemainingClientsConcurrently(int count)
+    private static List<AuthenticatedClient> connectRemainingClientsConcurrently(int count)
             throws Exception {
         ExecutorService connectors = Executors.newFixedThreadPool(count);
         CountDownLatch startGate = new CountDownLatch(1);
-        List<Future<SocketPacketChannel>> futures = new ArrayList<>();
+        List<Future<AuthenticatedClient>> futures = new ArrayList<>();
         try {
             for (int index = 0; index < count; index++) {
                 final int clientNumber = index;
                 futures.add(connectors.submit(() -> {
                     startGate.await();
-                    SocketPacketChannel channel = connectClient(RESPONSE_TIMEOUT_MS);
+                    String username = String.format("client%03d", clientNumber + 1);
+                    AuthenticatedClient client = connectAuthenticatedClient(
+                            RESPONSE_TIMEOUT_MS, username);
                     try {
-                        assertPong(channel, "concurrent-" + clientNumber);
-                        return channel;
+                        assertPong(client, "concurrent-" + clientNumber);
+                        return client;
                     } catch (Exception e) {
-                        channel.close();
+                        client.close();
                         throw e;
                     }
                 }));
             }
             startGate.countDown();
 
-            List<SocketPacketChannel> channels = new ArrayList<>();
+            List<AuthenticatedClient> channels = new ArrayList<>();
             try {
-                for (Future<SocketPacketChannel> future : futures) {
-                    channels.add(future.get(15, TimeUnit.SECONDS));
+                for (Future<AuthenticatedClient> future : futures) {
+                    channels.add(future.get(60, TimeUnit.SECONDS));
                 }
                 return channels;
             } catch (Exception e) {
@@ -138,21 +146,24 @@ public final class ServerIssue7AcceptanceTest {
         }
     }
 
-    private static SocketPacketChannel connectReplacementClient() throws Exception {
+    private static AuthenticatedClient connectReplacementClient() throws Exception {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
         int attempt = 0;
         while (System.nanoTime() < deadline) {
             SocketPacketChannel candidate = connectClient(TIMEOUT_TEST_READ_MS);
             boolean accepted = false;
             try {
-                Envelope ping = newPing("slot-reuse-" + attempt++);
-                candidate.send(ping);
                 Envelope response = candidate.receive();
-                if (response.getOp() == Opcode.PONG
-                        && ping.getId().equals(response.getId())) {
+                if (response.getOp() == Opcode.AUTH_CHALLENGE) {
+                    String username = "reuse" + attempt;
+                    authenticate(candidate, username, response);
+                    AuthenticatedClient replacement = new AuthenticatedClient(
+                            candidate, username);
+                    assertPong(replacement, "slot-reuse-" + attempt);
                     accepted = true;
-                    return candidate;
+                    return replacement;
                 }
+                attempt++;
                 TestSupport.assertEquals(Opcode.ERROR, response.getOp());
                 TestSupport.assertEquals("MAX_CLIENTS_REACHED", response.getString("code"));
             } finally {
@@ -165,10 +176,15 @@ public final class ServerIssue7AcceptanceTest {
         throw new AssertionError("Released client slot was not reusable within 5 seconds");
     }
 
-    private static void verifyNinetySecondTimeout(SocketPacketChannel idleClient)
+    private static void verifyNinetySecondTimeout(AuthenticatedClient idleClient)
             throws Exception {
         long startedAt = System.nanoTime();
-        TestSupport.assertThrows(IOException.class, idleClient::receive);
+        TestSupport.assertThrows(IOException.class, () -> {
+            while (true) {
+                Envelope pending = idleClient.channel.receive();
+                TestSupport.assertEquals(Opcode.PRESENCE, pending.getOp());
+            }
+        });
         long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt);
         TestSupport.assertTrue(elapsedMs >= MINIMUM_SERVER_TIMEOUT_MS,
                 "Client timed out too early: " + elapsedMs + " ms");
@@ -178,12 +194,16 @@ public final class ServerIssue7AcceptanceTest {
         idleClient.close();
     }
 
-    private static void assertClientsClosed(List<SocketPacketChannel> clients) throws Exception {
-        for (SocketPacketChannel client : clients) {
+    private static void assertClientsClosed(List<AuthenticatedClient> clients) throws Exception {
+        for (AuthenticatedClient client : clients) {
             long startedAt = System.nanoTime();
-            TestSupport.assertThrows(IOException.class, client::receive);
+            TestSupport.assertThrows(IOException.class, () -> {
+                while (true) {
+                    client.channel.receive();
+                }
+            });
             long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt);
-            TestSupport.assertTrue(elapsedMs < RESPONSE_TIMEOUT_MS,
+            TestSupport.assertTrue(elapsedMs < SHUTDOWN_CLOSE_TIMEOUT_MS,
                     "Client socket did not close promptly during shutdown");
         }
     }
@@ -194,7 +214,8 @@ public final class ServerIssue7AcceptanceTest {
         restartedThread.start();
         try {
             waitForServerStartup(restartedThread);
-            try (SocketPacketChannel client = connectClient(RESPONSE_TIMEOUT_MS)) {
+            try (AuthenticatedClient client = connectAuthenticatedClient(
+                    RESPONSE_TIMEOUT_MS, "restart_user")) {
                 assertPong(client, "ping-after-restart");
             }
             pass("Server restart");
@@ -221,10 +242,50 @@ public final class ServerIssue7AcceptanceTest {
         }
     }
 
-    private static void assertPong(SocketPacketChannel channel, String id) throws Exception {
-        Envelope ping = newPing(id);
-        channel.send(ping);
-        Envelope pong = channel.receive();
+    private static AuthenticatedClient connectAuthenticatedClient(
+            int readTimeoutMs, String username) throws Exception {
+        SocketPacketChannel channel = connectClient(readTimeoutMs);
+        try {
+            authenticate(channel, username, channel.receive());
+            return new AuthenticatedClient(channel, username);
+        } catch (Exception e) {
+            channel.close();
+            throw e;
+        }
+    }
+
+    private static void authenticate(SocketPacketChannel channel, String username,
+            Envelope challenge) throws Exception {
+        TestSupport.assertEquals(Opcode.AUTH_CHALLENGE, challenge.getOp());
+        String nonceBase64 = challenge.getString("nonce");
+        TestSupport.assertTrue(nonceBase64 != null,
+                "AUTH_CHALLENGE must contain nonce");
+        byte[] nonce = Base64.getDecoder().decode(nonceBase64);
+        TestSupport.assertEquals(32, nonce.length);
+
+        KeyPairGenerator generator = KeyPairGenerator.getInstance("RSA");
+        generator.initialize(2048);
+        KeyPair keyPair = generator.generateKeyPair();
+        Signature signer = Signature.getInstance("SHA256withRSA");
+        signer.initSign(keyPair.getPrivate());
+        signer.update(nonce);
+
+        Envelope auth = Envelope.create(Opcode.AUTH, username, "server")
+                .put("sig", Base64.getEncoder().encodeToString(signer.sign()))
+                .put("pubkey", Base64.getEncoder().encodeToString(
+                        keyPair.getPublic().getEncoded()));
+        channel.send(auth);
+        Envelope authOk = channel.receive();
+        TestSupport.assertEquals(Opcode.AUTH_OK, authOk.getOp());
+    }
+
+    private static void assertPong(AuthenticatedClient client, String id) throws Exception {
+        Envelope ping = newPing(id, client.username);
+        client.channel.send(ping);
+        Envelope pong;
+        do {
+            pong = client.channel.receive();
+        } while (pong.getOp() == Opcode.PRESENCE);
         TestSupport.assertEquals(Opcode.PONG, pong.getOp());
         TestSupport.assertEquals(ping.getId(), pong.getId());
         TestSupport.assertEquals("server", pong.getFrom());
@@ -236,8 +297,8 @@ public final class ServerIssue7AcceptanceTest {
                 "PONG body must be empty");
     }
 
-    private static Envelope newPing(String id) {
-        Envelope ping = Envelope.create(Opcode.PING, "issue-7-test", "server");
+    private static Envelope newPing(String id, String username) {
+        Envelope ping = Envelope.create(Opcode.PING, username, "server");
         ping.setId(id);
         return ping;
     }
@@ -247,10 +308,10 @@ public final class ServerIssue7AcceptanceTest {
         TestSupport.assertTrue(serverThread.isAlive(), "Server failed to start");
     }
 
-    private static void closeAll(List<SocketPacketChannel> channels) {
-        for (SocketPacketChannel channel : channels) {
+    private static void closeAll(List<AuthenticatedClient> clients) {
+        for (AuthenticatedClient client : clients) {
             try {
-                channel.close();
+                client.close();
             } catch (IOException ignored) {
             }
         }
@@ -258,5 +319,20 @@ public final class ServerIssue7AcceptanceTest {
 
     private static void pass(String message) {
         System.out.println("[PASS] " + message);
+    }
+
+    private static final class AuthenticatedClient implements AutoCloseable {
+        private final SocketPacketChannel channel;
+        private final String username;
+
+        private AuthenticatedClient(SocketPacketChannel channel, String username) {
+            this.channel = channel;
+            this.username = username;
+        }
+
+        @Override
+        public void close() throws IOException {
+            channel.close();
+        }
     }
 }

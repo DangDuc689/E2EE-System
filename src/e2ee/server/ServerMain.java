@@ -37,12 +37,12 @@ public class ServerMain {
     private final ConcurrentMap<String, ClientHandler> onlineUsers = new ConcurrentHashMap<>();
     private final PresenceDispatcher presenceDispatcher = new PresenceDispatcher(onlineUsers);
     private final MessageRouter messageRouter =
-            new Default1to1Router(onlineUsers, publicKeyRegistry);
+            new GroupRouter(onlineUsers, new Default1to1Router(onlineUsers, publicKeyRegistry));
     private final ThreadPoolExecutor clientExecutor;
 
     private volatile ServerSocket serverSocket;
 
-    ServerMain() {
+    public ServerMain() {
         /*
          * ==============================================
          * BOUNDED THREAD POOL
@@ -65,7 +65,7 @@ public class ServerMain {
         server.run();
     }
 
-    void run() {
+    public void run() {
         /*
          * ==============================================
          * SERVER SOCKET - ISSUE #7
@@ -127,7 +127,7 @@ public class ServerMain {
         }
     }
 
-    void shutdown() {
+    public void shutdown() {
         if (!shuttingDown.compareAndSet(false, true)) {
             return;
         }
@@ -162,7 +162,7 @@ public class ServerMain {
         System.out.println("[E2EE-SERVER] Server da dung an toan.");
     }
 
-    boolean isTerminated() {
+    public boolean isTerminated() {
         return clientExecutor.isTerminated();
     }
 

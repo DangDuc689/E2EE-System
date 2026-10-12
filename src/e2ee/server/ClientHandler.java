@@ -221,7 +221,9 @@ final class ClientHandler implements Runnable {
                     } else if (envelope.getOp() == Opcode.KEY_PUBLISH) {
                         handleKeyPublish(envelope);
                     } else if (envelope.getOp() == Opcode.CHAT_1TO1
-                            || envelope.getOp() == Opcode.KEY_LOOKUP) {
+                            || envelope.getOp() == Opcode.KEY_LOOKUP
+                            || envelope.getOp() == Opcode.GROUP_CREATE
+                            || envelope.getOp() == Opcode.CHAT_GROUP) {
                         envelope.setFrom(authenticatedUsername);
                         messageRouter.route(envelope, this);
                     }

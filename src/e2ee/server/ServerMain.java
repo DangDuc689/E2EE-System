@@ -19,7 +19,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /**
  * Điểm khởi chạy của máy chủ E2EE Server (Blind Relay & Key Registry).
  * 
- * RÀNG BUỘC KIẾN TRÚC SỐNG CÒN (Issue #7 - Bình An phụ trách):
+ * RÀNG BUỘC KIẾN TRÚC SỐNG CÒN (Issue 12 - Store-and-Forward & Offline Queue):
  * - Server đóng vai trò Blind Relay (Chuyển tiếp mù).
  * - Server chỉ đọc Metadata của Envelope để chuyển gói (`to`, `groupId`).
  * - TUYỆT ĐỐI KHÔNG import hoặc sử dụng `javax.crypto.Cipher` trong toàn bộ
@@ -36,8 +36,16 @@ public class ServerMain {
     private final ConcurrentMap<String, String> publicKeyRegistry = new ConcurrentHashMap<>();
     private final ConcurrentMap<String, ClientHandler> onlineUsers = new ConcurrentHashMap<>();
     private final PresenceDispatcher presenceDispatcher = new PresenceDispatcher(onlineUsers);
+    private final OfflineMessageQueue offlineQueue = new OfflineMessageQueue();
     private final MessageRouter messageRouter =
-            new GroupRouter(onlineUsers, new Default1to1Router(onlineUsers, publicKeyRegistry));
+            new GroupRouter(
+                    onlineUsers,
+                    new ConcurrentHashMap<>(),
+                    offlineQueue,
+                    new OfflineQueueRouter(
+                            onlineUsers,
+                            offlineQueue,
+                            new Default1to1Router(onlineUsers, publicKeyRegistry)));
     private final ThreadPoolExecutor clientExecutor;
 
     private volatile ServerSocket serverSocket;
@@ -68,7 +76,7 @@ public class ServerMain {
     public void run() {
         /*
          * ==============================================
-         * SERVER SOCKET - ISSUE #7
+         * SERVER SOCKET - ISSUE #12
          * ==============================================
          */
         ServerSocket listeningSocket;
@@ -202,5 +210,13 @@ public class ServerMain {
             System.err.println("[E2EE-SERVER] Loi khi tu choi client: "
                     + e.getMessage());
         }
+    }
+
+    public OfflineMessageQueue getOfflineQueue() {
+        return offlineQueue;
+    }
+
+    public MessageRouter getMessageRouter() {
+        return messageRouter;
     }
 }

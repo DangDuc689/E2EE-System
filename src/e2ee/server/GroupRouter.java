@@ -23,20 +23,30 @@ import java.util.concurrent.ConcurrentMap;
 public final class GroupRouter implements MessageRouter {
     private final ConcurrentMap<String, ClientHandler> onlineUsers;
     private final ConcurrentMap<String, Set<String>> groupRegistry;
+    private final OfflineMessageQueue offlineQueue;
     private final MessageRouter nextRouter;
 
     public GroupRouter(
             ConcurrentMap<String, ClientHandler> onlineUsers,
             MessageRouter nextRouter) {
-        this(onlineUsers, new ConcurrentHashMap<>(), nextRouter);
+        this(onlineUsers, new ConcurrentHashMap<>(), null, nextRouter);
     }
 
     public GroupRouter(
             ConcurrentMap<String, ClientHandler> onlineUsers,
             ConcurrentMap<String, Set<String>> groupRegistry,
             MessageRouter nextRouter) {
+        this(onlineUsers, groupRegistry, null, nextRouter);
+    }
+
+    public GroupRouter(
+            ConcurrentMap<String, ClientHandler> onlineUsers,
+            ConcurrentMap<String, Set<String>> groupRegistry,
+            OfflineMessageQueue offlineQueue,
+            MessageRouter nextRouter) {
         this.onlineUsers = onlineUsers;
         this.groupRegistry = groupRegistry;
+        this.offlineQueue = offlineQueue;
         this.nextRouter = nextRouter;
     }
 
@@ -79,7 +89,7 @@ public final class GroupRouter implements MessageRouter {
         }
 
         // Đảm bảo người tạo cũng nằm trong danh sách thành viên nhóm
-        String creator = sender.authenticatedUsername();
+        String creator = sender != null ? sender.authenticatedUsername() : env.getFrom();
         if (creator != null && !creator.isBlank()) {
             memberSet.add(creator);
         }
@@ -87,10 +97,12 @@ public final class GroupRouter implements MessageRouter {
         groupRegistry.put(groupId, memberSet);
 
         // Phản hồi thông báo đã tạo nhóm thành công cho client tạo nhóm
-        Envelope confirm = Envelope.createGroup(Opcode.GROUP_CREATE, "server", groupId)
-                .put("status", "CREATED")
-                .put("groupId", groupId);
-        sender.sendRouterEnvelope(confirm);
+        if (sender != null) {
+            Envelope confirm = Envelope.createGroup(Opcode.GROUP_CREATE, "server", groupId)
+                    .put("status", "CREATED")
+                    .put("groupId", groupId);
+            sender.sendRouterEnvelope(confirm);
+        }
     }
 
     private void handleChatGroup(Envelope env, ClientHandler sender) throws IOException {
@@ -106,13 +118,15 @@ public final class GroupRouter implements MessageRouter {
             return;
         }
 
-        String senderUsername = sender.authenticatedUsername();
+        String senderUsername = sender != null ? sender.authenticatedUsername() : env.getFrom();
         if (senderUsername != null && !members.contains(senderUsername)) {
-            sender.sendRouterError("NOT_IN_GROUP", "You are not a member of this group");
+            if (sender != null) {
+                sender.sendRouterError("NOT_IN_GROUP", "You are not a member of this group");
+            }
             return;
         }
 
-        // Chuyển tiếp mù Envelope tới tất cả thành viên trong nhóm đang online (trừ người gửi)
+        // Chuyển tiếp mù Envelope tới tất cả thành viên trong nhóm (trừ người gửi)
         for (String member : members) {
             if (member.equals(senderUsername)) {
                 continue;
@@ -120,9 +134,23 @@ public final class GroupRouter implements MessageRouter {
             ClientHandler recipient = onlineUsers.get(member);
             if (recipient != null) {
                 try {
-                    recipient.sendRoutedEnvelopeIfCurrent(member, env);
+                    if (!recipient.sendRoutedEnvelopeIfCurrent(member, env)) {
+                        if (offlineQueue != null) {
+                            offlineQueue.enqueue(member, env);
+                        }
+                    }
                 } catch (IOException e) {
                     recipient.closeRoutedSession();
+                    if (offlineQueue != null) {
+                        offlineQueue.enqueue(member, env);
+                    }
+                }
+            } else {
+                // Thành viên nhóm offline -> đưa vào hàng đợi offline
+                if (offlineQueue != null) {
+                    offlineQueue.enqueue(member, env);
+                    System.out.println("[E2EE-SERVER] [Issue 12] Thanh vien nhom '" + member
+                            + "' offline. Da luu Envelope nhom id=" + env.getId() + " vao OfflineMessageQueue.");
                 }
             }
         }
@@ -135,5 +163,9 @@ public final class GroupRouter implements MessageRouter {
 
     public ConcurrentMap<String, Set<String>> getGroupRegistry() {
         return groupRegistry;
+    }
+
+    public MessageRouter getNextRouter() {
+        return nextRouter;
     }
 }

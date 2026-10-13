@@ -223,7 +223,8 @@ final class ClientHandler implements Runnable {
                     } else if (envelope.getOp() == Opcode.CHAT_1TO1
                             || envelope.getOp() == Opcode.KEY_LOOKUP
                             || envelope.getOp() == Opcode.GROUP_CREATE
-                            || envelope.getOp() == Opcode.CHAT_GROUP) {
+                            || envelope.getOp() == Opcode.CHAT_GROUP
+                            || envelope.getOp() == Opcode.ACK) {
                         envelope.setFrom(authenticatedUsername);
                         messageRouter.route(envelope, this);
                     }
@@ -304,7 +305,16 @@ final class ClientHandler implements Runnable {
         beforePresenceSnapshot.run();
         sendPresenceSnapshot(channel, registration.snapshot());
         presenceDispatcher.activate(username, this);
+        sendOfflineSyncIfAvailable(channel, username);
         return true;
+    }
+
+    private void sendOfflineSyncIfAvailable(SocketPacketChannel channel, String username)
+            throws IOException {
+        OfflineQueueRouter oqr = OfflineQueueRouter.findIn(messageRouter);
+        if (oqr != null) {
+            oqr.syncOfflineMessages(username, channel);
+        }
     }
 
     private void sendPresenceSnapshot(SocketPacketChannel channel,

@@ -42,6 +42,8 @@ public final class ChatClientControllerAuthTest {
                 ChatClientControllerAuthTest::testAuthenticationError);
         TestSupport.check("CCC-A4 - Network ngoai EDT, callback tren EDT",
                 ChatClientControllerAuthTest::testThreadRules);
+        TestSupport.check("CCC-A5 - Tu choi nonce khong dung 32 byte",
+                ChatClientControllerAuthTest::testInvalidNonceLength);
 
         TestSupport.summary();
     }
@@ -157,6 +159,34 @@ public final class ChatClientControllerAuthTest {
         }
     }
 
+    private static void testInvalidNonceLength() throws Exception {
+        TestContext context = TestContext.create();
+        char[] passphrase = "invalid-nonce-passphrase".toCharArray();
+        ChatClientController controller = null;
+        try {
+            context.identityStore.create("alice", passphrase);
+            FakeAuthServer server = FakeAuthServer.invalidNonce("alice");
+            controller = context.newController(server);
+            RecordingListener listener = new RecordingListener();
+            controller.setListener(listener);
+
+            controller.login("localhost", 8888, "alice", passphrase);
+            listener.awaitError();
+            server.awaitFinished();
+
+            TestSupport.assertEquals("CONNECTION_FAILED",
+                    listener.errorCode.get());
+            TestSupport.assertEquals(ChatClientController.State.DISCONNECTED,
+                    controller.getState());
+        } finally {
+            if (controller != null) {
+                controller.close();
+            }
+            ClientCryptoEngine.wipeMemory(passphrase);
+            context.delete();
+        }
+    }
+
     private static final class RecordingListener
             implements ChatClientController.Listener {
         private final CountDownLatch authenticated = new CountDownLatch(1);
@@ -195,39 +225,48 @@ public final class ChatClientControllerAuthTest {
         private final String expectedUsername;
         private final String errorCode;
         private final String errorMessage;
+        private final int nonceLength;
         private final CountDownLatch finished = new CountDownLatch(1);
         private final AtomicBoolean authPayloadValid = new AtomicBoolean();
 
         private FakeAuthServer(String expectedUsername,
-                String errorCode, String errorMessage) {
+                String errorCode, String errorMessage, int nonceLength) {
             PacketChannel[] pair = LoopbackChannel.pair();
             this.clientChannel = pair[0];
             this.serverChannel = pair[1];
             this.expectedUsername = expectedUsername;
             this.errorCode = errorCode;
             this.errorMessage = errorMessage;
+            this.nonceLength = nonceLength;
             Thread serverThread = new Thread(this::run, "fake-auth-server");
             serverThread.setDaemon(true);
             serverThread.start();
         }
 
         private static FakeAuthServer success(String username) {
-            return new FakeAuthServer(username, null, null);
+            return new FakeAuthServer(username, null, null, 32);
         }
 
         private static FakeAuthServer failure(String username,
                 String code, String message) {
-            return new FakeAuthServer(username, code, message);
+            return new FakeAuthServer(username, code, message, 32);
+        }
+
+        private static FakeAuthServer invalidNonce(String username) {
+            return new FakeAuthServer(username, null, null, 16);
         }
 
         private void run() {
-            byte[] nonce = new byte[32];
+            byte[] nonce = new byte[nonceLength];
             new SecureRandom().nextBytes(nonce);
             try {
                 serverChannel.send(Envelope.create(
                         Opcode.AUTH_CHALLENGE, "server", null)
                         .put("nonce", Base64.getEncoder()
                                 .encodeToString(nonce)));
+                if (nonceLength != 32) {
+                    return;
+                }
                 Envelope auth = serverChannel.receive();
                 authPayloadValid.set(validateAuth(auth, nonce));
                 if (errorCode == null) {

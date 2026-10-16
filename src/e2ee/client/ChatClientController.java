@@ -362,6 +362,10 @@ public final class ChatClientController implements AutoCloseable {
                 throw new IOException("Nonce Base64 khong hop le", e);
             }
 
+            if (nonce.length != 32) {
+                ClientCryptoEngine.wipeMemory(nonce);
+                throw new IOException("AUTH_CHALLENGE nonce phai dung 32 byte");
+            }
             byte[] signature = null;
             try {
                 signature = ClientCryptoService.signChallenge(

@@ -3,9 +3,9 @@ package e2ee.client;
 import e2ee.client.identity.ClientIdentityStore;
 import e2ee.client.security.LocalTrustStore;
 import e2ee.client.ui.ChatFrame;
+import e2ee.client.ui.FingerprintDialog;
 import e2ee.client.ui.LoginFrame;
 
-import javax.swing.JOptionPane;
 import javax.swing.SwingUtilities;
 import javax.swing.UIManager;
 import java.io.IOException;
@@ -93,12 +93,14 @@ public class ClientMain {
         }
 
         @Override
+        public void onSendMessage(String username, String content,
+                int ttlSeconds) {
+            controller.sendMessage(username, content, ttlSeconds);
+        }
+
+        @Override
         public void onOpenSecurity(String username) {
-            JOptionPane.showMessageDialog(chatFrame,
-                    "Đối soát fingerprint của " + username
-                    + " sẽ được hoàn thiện trong Issue #14.",
-                    "Đối soát bảo mật",
-                    JOptionPane.INFORMATION_MESSAGE);
+            controller.requestFingerprintDetails(username);
         }
 
         @Override
@@ -178,7 +180,7 @@ public class ClientMain {
                 chatFrame.updatePresence(username,
                         controller.isPeerOnline(username));
                 chatFrame.selectPeer(username);
-                chatFrame.setPeerSendAllowed(username, false);
+                chatFrame.setPeerSecurityWarning(username, true);
                 chatFrame.showBanner(
                         "CẢNH BÁO: Khóa của " + username
                         + " đã thay đổi. Đã khóa gửi tin.",
@@ -196,9 +198,17 @@ public class ClientMain {
         @Override
         public void onMessageSent(String recipientUsername, String content,
                 String messageId, long timestamp) {
+            onMessageSentWithTtl(recipientUsername, content,
+                    messageId, timestamp, 0);
+        }
+
+        @Override
+        public void onMessageSentWithTtl(String recipientUsername,
+                String content, String messageId, long timestamp,
+                int ttlSeconds) {
             if (chatFrame != null) {
                 chatFrame.addMessage(recipientUsername,
-                        content, timestamp, true);
+                        content, timestamp, true, ttlSeconds);
             }
         }
 
@@ -219,6 +229,32 @@ public class ClientMain {
                 chatFrame.showBanner("Cảnh báo bảo mật từ "
                         + username + ": " + message,
                         ChatFrame.BannerType.ERROR);
+            }
+        }
+
+        @Override
+        public void onFingerprintDetails(String username,
+                String myFingerprint, String peerFingerprint,
+                boolean keyChanged) {
+            if (chatFrame == null) {
+                return;
+            }
+            FingerprintDialog dialog = new FingerprintDialog(
+                    chatFrame, username, myFingerprint, peerFingerprint,
+                    keyChanged, () -> controller.acceptPeerKey(
+                            username, peerFingerprint));
+            dialog.setVisible(true);
+        }
+
+        @Override
+        public void onPeerTrustRestored(String username,
+                String fingerprint) {
+            if (chatFrame != null) {
+                chatFrame.setPeerSecurityWarning(username, false);
+                chatFrame.setPeerSendAllowed(username, true);
+                chatFrame.showBanner(
+                        "Đã xác minh lại khóa của " + username,
+                        ChatFrame.BannerType.CONNECTED);
             }
         }
 

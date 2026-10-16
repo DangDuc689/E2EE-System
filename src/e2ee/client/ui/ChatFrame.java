@@ -1,6 +1,9 @@
 package e2ee.client.ui;
 
+import e2ee.client.crypto.ClientCryptoService;
+
 import javax.swing.BorderFactory;
+import javax.swing.JComboBox;
 import javax.swing.DefaultListModel;
 import javax.swing.JButton;
 import javax.swing.JFrame;
@@ -14,6 +17,7 @@ import javax.swing.JTextField;
 import javax.swing.ListSelectionModel;
 import javax.swing.SwingConstants;
 import javax.swing.SwingUtilities;
+import javax.swing.Timer;
 import java.awt.BorderLayout;
 import java.awt.Color;
 import java.awt.Dimension;
@@ -23,6 +27,7 @@ import java.awt.event.KeyAdapter;
 import java.awt.event.KeyEvent;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -35,6 +40,10 @@ import java.util.Objects;
 public final class ChatFrame extends JFrame {
     private static final Color PRIMARY = new Color(37, 99, 235);
     private static final Color BACKGROUND = new Color(248, 250, 252);
+    private static final Color SECURITY_WARNING_BACKGROUND =
+            new Color(254, 226, 226);
+    private static final Color SECURITY_WARNING_FOREGROUND =
+            new Color(153, 27, 27);
 
     private final String myUsername;
     private final Actions actions;
@@ -44,8 +53,16 @@ public final class ChatFrame extends JFrame {
     private final JTextField addFriendField = new JTextField();
     private final JPanel messagesPanel = new JPanel();
     private final JScrollPane messagesScroll;
+    private final JPanel conversationPanel = new JPanel(new BorderLayout());
+    private final JPanel composerPanel = new JPanel(new BorderLayout(8, 8));
     private final JTextArea messageInput = new JTextArea(2, 24);
     private final JButton sendButton = new JButton("Gửi");
+    private final JComboBox<TtlOption> ttlSelector = new JComboBox<>(
+            new TtlOption[]{
+                new TtlOption("Không tự hủy", 0),
+                new TtlOption("Tự hủy sau 10 giây", 10),
+                new TtlOption("Tự hủy sau 30 giây", 30)
+            });
     private final JButton securityButton = new JButton("🔒 Đối soát");
     private final JLabel conversationTitle = new JLabel(
             "Chọn một người bạn", SwingConstants.CENTER);
@@ -56,6 +73,9 @@ public final class ChatFrame extends JFrame {
     private final Map<String, List<ChatMessage>> conversations =
             new HashMap<>();
     private final Map<String, Boolean> sendAllowed = new HashMap<>();
+    private final Map<String, Boolean> securityWarnings = new HashMap<>();
+    private final Timer expiryTimer = new Timer(
+            1_000, event -> expireMessages(System.currentTimeMillis()));
 
     private String selectedPeer;
 
@@ -68,6 +88,7 @@ public final class ChatFrame extends JFrame {
         messagesScroll = new JScrollPane(messagesPanel);
         initializeUi();
         bindActions();
+        expiryTimer.start();
     }
 
     private void initializeUi() {
@@ -123,7 +144,6 @@ public final class ChatFrame extends JFrame {
     }
 
     private JPanel createConversationPanel() {
-        JPanel conversation = new JPanel(new BorderLayout());
         conversationTitle.setFont(
                 conversationTitle.getFont().deriveFont(Font.BOLD, 17f));
         conversationTitle.setBorder(
@@ -136,15 +156,15 @@ public final class ChatFrame extends JFrame {
         messagesScroll.setBorder(BorderFactory.createEmptyBorder());
         messagesScroll.getVerticalScrollBar().setUnitIncrement(16);
 
-        conversation.add(conversationTitle, BorderLayout.NORTH);
-        conversation.add(messagesScroll, BorderLayout.CENTER);
-        conversation.add(createComposer(), BorderLayout.SOUTH);
-        return conversation;
+        conversationPanel.add(conversationTitle, BorderLayout.NORTH);
+        conversationPanel.add(messagesScroll, BorderLayout.CENTER);
+        conversationPanel.add(createComposer(), BorderLayout.SOUTH);
+        return conversationPanel;
     }
 
     private JPanel createComposer() {
-        JPanel composer = new JPanel(new BorderLayout(8, 8));
-        composer.setBorder(BorderFactory.createEmptyBorder(10, 12, 12, 12));
+        composerPanel.setBorder(
+                BorderFactory.createEmptyBorder(10, 12, 12, 12));
         messageInput.setLineWrap(true);
         messageInput.setWrapStyleWord(true);
         messageInput.setEnabled(false);
@@ -154,12 +174,14 @@ public final class ChatFrame extends JFrame {
         sendButton.setEnabled(false);
         sendButton.setBackground(PRIMARY);
         sendButton.setForeground(Color.WHITE);
+        ttlSelector.setToolTipText("Thời gian tồn tại của tin nhắn");
+        buttons.add(ttlSelector);
         buttons.add(securityButton);
         buttons.add(sendButton);
 
-        composer.add(new JScrollPane(messageInput), BorderLayout.CENTER);
-        composer.add(buttons, BorderLayout.EAST);
-        return composer;
+        composerPanel.add(new JScrollPane(messageInput), BorderLayout.CENTER);
+        composerPanel.add(buttons, BorderLayout.EAST);
+        return composerPanel;
     }
 
     private void bindActions() {
@@ -208,7 +230,9 @@ public final class ChatFrame extends JFrame {
                 || !sendButton.isEnabled()) {
             return;
         }
-        actions.onSendMessage(selectedPeer, content);
+        TtlOption option = (TtlOption) ttlSelector.getSelectedItem();
+        int ttlSeconds = option != null ? option.seconds : 0;
+        actions.onSendMessage(selectedPeer, content, ttlSeconds);
         messageInput.setText("");
     }
 
@@ -244,10 +268,20 @@ public final class ChatFrame extends JFrame {
 
     public void addMessage(String peerUsername, String content,
             long timestamp, boolean sentByMe) {
+        addMessage(peerUsername, content, timestamp, sentByMe, 0);
+    }
+
+    public void addMessage(String peerUsername, String content,
+            long timestamp, boolean sentByMe, int ttlSeconds) {
         requireEdt();
+        if (ttlSeconds < 0 || ttlSeconds > 86_400) {
+            throw new IllegalArgumentException("TTL khong hop le");
+        }
         conversations.computeIfAbsent(peerUsername,
                 ignored -> new ArrayList<>())
-                .add(new ChatMessage(content, timestamp, sentByMe));
+                .add(new ChatMessage(content, timestamp, sentByMe,
+                        ttlSeconds == 0 ? 0L
+                                : timestamp + ttlSeconds * 1_000L));
         if (peerUsername.equals(selectedPeer)) {
             renderSelectedConversation();
         }
@@ -257,6 +291,21 @@ public final class ChatFrame extends JFrame {
         requireEdt();
         sendAllowed.put(username, allowed);
         updateComposerState();
+    }
+
+    /**
+     * Hiển thị trạng thái nguy hiểm cho đúng cuộc trò chuyện có khóa thay đổi.
+     */
+    public void setPeerSecurityWarning(String username, boolean warning) {
+        requireEdt();
+        securityWarnings.put(username, warning);
+        if (warning) {
+            sendAllowed.put(username, false);
+        }
+        if (Objects.equals(selectedPeer, username)) {
+            updateSecurityAppearance();
+            updateComposerState();
+        }
     }
 
     public void showBanner(String message, BannerType type) {
@@ -288,11 +337,14 @@ public final class ChatFrame extends JFrame {
             for (ChatMessage message : conversations.getOrDefault(
                     selectedPeer, List.of())) {
                 messagesPanel.add(new MessageBubble(
-                        message.content, message.timestamp,
-                        message.sentByMe));
+                        message.content(), message.timestamp,
+                        message.sentByMe,
+                        remainingSeconds(message,
+                                System.currentTimeMillis())));
             }
         }
         updateComposerState();
+        updateSecurityAppearance();
         messagesPanel.revalidate();
         messagesPanel.repaint();
         SwingUtilities.invokeLater(() -> messagesScroll
@@ -307,6 +359,62 @@ public final class ChatFrame extends JFrame {
         messageInput.setEnabled(allowed);
         sendButton.setEnabled(allowed);
         securityButton.setEnabled(hasPeer);
+        ttlSelector.setEnabled(allowed);
+    }
+
+    private void expireMessages(long now) {
+        requireEdt();
+        boolean selectedConversationChanged = false;
+        for (Map.Entry<String, List<ChatMessage>> entry
+                : conversations.entrySet()) {
+            List<ChatMessage> messages = entry.getValue();
+            for (int index = messages.size() - 1; index >= 0; index--) {
+                ChatMessage message = messages.get(index);
+                if (message.expiresAt > 0 && message.expiresAt <= now) {
+                    message.wipe();
+                    messages.remove(index);
+                    if (entry.getKey().equals(selectedPeer)) {
+                        selectedConversationChanged = true;
+                    }
+                }
+            }
+        }
+        if (selectedConversationChanged) {
+            renderSelectedConversation();
+        } else if (selectedPeer != null) {
+            // Cập nhật số giây còn lại trên bong bóng đang hiển thị.
+            boolean hasExpiringMessage = conversations.getOrDefault(
+                    selectedPeer, List.of()).stream()
+                    .anyMatch(message -> message.expiresAt > 0);
+            if (hasExpiringMessage) {
+                renderSelectedConversation();
+            }
+        }
+    }
+
+    private static int remainingSeconds(ChatMessage message, long now) {
+        if (message.expiresAt == 0) {
+            return 0;
+        }
+        long remainingMs = Math.max(0L, message.expiresAt - now);
+        return (int) Math.max(1L, (remainingMs + 999L) / 1_000L);
+    }
+
+    private void updateSecurityAppearance() {
+        boolean warning = selectedPeer != null
+                && securityWarnings.getOrDefault(selectedPeer, false);
+        Color background = warning
+                ? SECURITY_WARNING_BACKGROUND : BACKGROUND;
+        messagesPanel.setBackground(background);
+        composerPanel.setBackground(background);
+        conversationTitle.setOpaque(warning);
+        conversationTitle.setBackground(background);
+        conversationTitle.setForeground(warning
+                ? SECURITY_WARNING_FOREGROUND : Color.BLACK);
+        conversationPanel.setBorder(warning
+                ? BorderFactory.createLineBorder(
+                        SECURITY_WARNING_FOREGROUND, 3)
+                : BorderFactory.createEmptyBorder());
     }
 
     int getFriendCount() {
@@ -319,6 +427,33 @@ public final class ChatFrame extends JFrame {
 
     boolean isSendEnabled() {
         return sendButton.isEnabled();
+    }
+
+    boolean isSecurityWarningVisible() {
+        return selectedPeer != null
+                && securityWarnings.getOrDefault(selectedPeer, false)
+                && SECURITY_WARNING_BACKGROUND.equals(
+                        messagesPanel.getBackground());
+    }
+
+    void expireMessagesForTest(long now) {
+        expireMessages(now);
+    }
+
+    void selectTtlForTest(int ttlSeconds) {
+        for (int index = 0; index < ttlSelector.getItemCount(); index++) {
+            TtlOption option = ttlSelector.getItemAt(index);
+            if (option.seconds == ttlSeconds) {
+                ttlSelector.setSelectedIndex(index);
+                return;
+            }
+        }
+        throw new IllegalArgumentException("TTL khong co trong giao dien");
+    }
+
+    int getSelectedTtlForTest() {
+        TtlOption option = (TtlOption) ttlSelector.getSelectedItem();
+        return option != null ? option.seconds : 0;
     }
 
     private static void requireEdt() {
@@ -338,6 +473,11 @@ public final class ChatFrame extends JFrame {
         void onLookupPeer(String username);
 
         void onSendMessage(String username, String content);
+
+        default void onSendMessage(String username, String content,
+                int ttlSeconds) {
+            onSendMessage(username, content);
+        }
 
         void onOpenSecurity(String username);
 
@@ -368,15 +508,53 @@ public final class ChatFrame extends JFrame {
     }
 
     private static final class ChatMessage {
-        private final String content;
+        private final byte[] contentBytes;
         private final long timestamp;
         private final boolean sentByMe;
+        private final long expiresAt;
 
         private ChatMessage(String content, long timestamp,
-                boolean sentByMe) {
-            this.content = content;
+                boolean sentByMe, long expiresAt) {
+            this.contentBytes = (content == null ? "" : content)
+                    .getBytes(StandardCharsets.UTF_8);
             this.timestamp = timestamp;
             this.sentByMe = sentByMe;
+            this.expiresAt = expiresAt;
         }
+
+        private String content() {
+            return new String(contentBytes, StandardCharsets.UTF_8);
+        }
+
+        private void wipe() {
+            ClientCryptoService.wipeMemory(contentBytes);
+        }
+    }
+
+    private static final class TtlOption {
+        private final String label;
+        private final int seconds;
+
+        private TtlOption(String label, int seconds) {
+            this.label = label;
+            this.seconds = seconds;
+        }
+
+        @Override
+        public String toString() {
+            return label;
+        }
+    }
+
+    @Override
+    public void dispose() {
+        expiryTimer.stop();
+        for (List<ChatMessage> messages : conversations.values()) {
+            for (ChatMessage message : messages) {
+                message.wipe();
+            }
+        }
+        conversations.clear();
+        super.dispose();
     }
 }

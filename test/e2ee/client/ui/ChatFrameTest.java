@@ -46,15 +46,31 @@ public final class ChatFrameTest {
             frame.markPeerKeyAvailable("bob");
             frame.addMessage("bob", "Tin gui", 1_000L, true);
             frame.addMessage("bob", "Tin nhan", 2_000L, false);
+            frame.addMessage("bob", "Tin tu huy",
+                    System.currentTimeMillis(), true, 10);
 
             TestSupport.assertEquals(1, frame.getFriendCount());
-            TestSupport.assertEquals(2, frame.getDisplayedMessageCount());
+            TestSupport.assertEquals(3, frame.getDisplayedMessageCount());
             TestSupport.assertTrue(frame.isSendEnabled(),
                     "Nut gui phai bat khi co peer hop le");
 
             frame.setPeerSendAllowed("bob", false);
             TestSupport.assertTrue(!frame.isSendEnabled(),
                     "Nut gui phai khoa khi peer khong an toan");
+            frame.setPeerSecurityWarning("bob", true);
+            TestSupport.assertTrue(frame.isSecurityWarningVisible(),
+                    "Khung chat phai doi mau khi khoa peer thay doi");
+            frame.setPeerSecurityWarning("bob", false);
+            frame.setPeerSendAllowed("bob", true);
+            TestSupport.assertTrue(!frame.isSecurityWarningVisible(),
+                    "Canh bao phai duoc go sau khi doi soat");
+            TestSupport.assertTrue(frame.isSendEnabled(),
+                    "Nut gui phai mo lai sau khi doi soat");
+            frame.selectTtlForTest(10);
+            TestSupport.assertEquals(10,
+                    frame.getSelectedTtlForTest());
+            frame.expireMessagesForTest(Long.MAX_VALUE);
+            TestSupport.assertEquals(2, frame.getDisplayedMessageCount());
             TestSupport.assertTrue(frame.getMinimumSize().width >= 800,
                     "ChatFrame phai co layout co gian hop ly");
             frame.dispose();

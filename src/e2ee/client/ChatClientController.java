@@ -24,7 +24,10 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -33,6 +36,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 public final class ChatClientController implements AutoCloseable {
     public static final int DEFAULT_CONNECT_TIMEOUT_MS = 5_000;
+    public static final long KEEP_ALIVE_INTERVAL_SECONDS = 30L;
     private static final int MAX_PENDING_MESSAGES_PER_PEER = 100;
 
     private final Object lifecycleLock = new Object();
@@ -41,6 +45,8 @@ public final class ChatClientController implements AutoCloseable {
     private final ClientCryptoService cryptoService;
     private final ChannelConnector channelConnector;
     private final ExecutorService backgroundExecutor;
+    private final ScheduledExecutorService scheduler;
+    private final long keepAliveIntervalSeconds;
     private final ConcurrentMap<String, PublicKey> peerPublicKeys =
             new ConcurrentHashMap<>();
     private final ConcurrentMap<String, Boolean> presenceByUsername =
@@ -53,19 +59,30 @@ public final class ChatClientController implements AutoCloseable {
     private volatile State state = State.DISCONNECTED;
     private volatile PacketChannel channel;
     private volatile Identity identity;
+    private volatile ScheduledFuture<?> keepAliveTask;
     private volatile boolean closed;
 
     public ChatClientController(ClientIdentityStore identityStore,
             LocalTrustStore trustStore) {
         this(identityStore, trustStore,
                 new ClientCryptoService(),
-                SocketPacketChannel::connect);
+                SocketPacketChannel::connect,
+                KEEP_ALIVE_INTERVAL_SECONDS);
     }
 
     ChatClientController(ClientIdentityStore identityStore,
             LocalTrustStore trustStore,
             ClientCryptoService cryptoService,
             ChannelConnector channelConnector) {
+        this(identityStore, trustStore, cryptoService, channelConnector,
+                KEEP_ALIVE_INTERVAL_SECONDS);
+    }
+
+    ChatClientController(ClientIdentityStore identityStore,
+            LocalTrustStore trustStore,
+            ClientCryptoService cryptoService,
+            ChannelConnector channelConnector,
+            long keepAliveIntervalSeconds) {
         this.identityStore = Objects.requireNonNull(
                 identityStore, "identityStore cannot be null");
         this.trustStore = Objects.requireNonNull(
@@ -74,8 +91,15 @@ public final class ChatClientController implements AutoCloseable {
                 cryptoService, "cryptoService cannot be null");
         this.channelConnector = Objects.requireNonNull(
                 channelConnector, "channelConnector cannot be null");
+        if (keepAliveIntervalSeconds < 1) {
+            throw new IllegalArgumentException(
+                    "keepAliveIntervalSeconds phai lon hon 0");
+        }
+        this.keepAliveIntervalSeconds = keepAliveIntervalSeconds;
         this.backgroundExecutor = Executors.newFixedThreadPool(
                 2, new ClientThreadFactory());
+        this.scheduler = Executors.newSingleThreadScheduledExecutor(
+                new ClientSchedulerThreadFactory());
     }
 
     public void setListener(Listener listener) {
@@ -253,6 +277,7 @@ public final class ChatClientController implements AutoCloseable {
             presenceByUsername.clear();
             pendingMessages.clear();
         }
+        stopKeepAlive();
         closeQuietly(current);
         if (!closed) {
             setState(State.DISCONNECTED);
@@ -335,6 +360,7 @@ public final class ChatClientController implements AutoCloseable {
                 identity = candidateIdentity;
             }
             setState(State.CONNECTED);
+            startKeepAlive(candidateChannel, candidateIdentity);
             dispatchUi(() -> listener.onAuthenticated(
                     candidateIdentity.getUsername()));
             receiveLoop(candidateChannel);
@@ -374,6 +400,9 @@ public final class ChatClientController implements AutoCloseable {
             case KEY_LOOKUP_RESULT -> handleKeyLookupResult(envelope);
             case PRESENCE -> handlePresence(envelope);
             case CHAT_1TO1 -> handleIncomingChat(envelope);
+            case PONG -> {
+                // PONG xác nhận kết nối còn sống; không cần cập nhật giao diện.
+            }
             default -> {
                 // Các opcode chat, keep-alive và offline được xử lý ở lát cắt sau.
             }
@@ -542,7 +571,38 @@ public final class ChatClientController implements AutoCloseable {
         }
     }
 
+    private void startKeepAlive(PacketChannel activeChannel,
+            Identity activeIdentity) {
+        stopKeepAlive();
+        keepAliveTask = scheduler.scheduleAtFixedRate(() -> {
+            if (closed || state != State.CONNECTED
+                    || channel != activeChannel
+                    || !activeChannel.isOpen()) {
+                return;
+            }
+            Envelope ping = Envelope.create(
+                    Opcode.PING, activeIdentity.getUsername(), "server");
+            try {
+                activeChannel.send(ping);
+            } catch (IOException e) {
+                if (channel == activeChannel && !closed) {
+                    connectionLost(e.getMessage());
+                }
+            }
+        }, keepAliveIntervalSeconds, keepAliveIntervalSeconds,
+                TimeUnit.SECONDS);
+    }
+
+    private void stopKeepAlive() {
+        ScheduledFuture<?> currentTask = keepAliveTask;
+        keepAliveTask = null;
+        if (currentTask != null) {
+            currentTask.cancel(false);
+        }
+    }
+
     private void connectionLost(String message) {
+        stopKeepAlive();
         synchronized (lifecycleLock) {
             closeQuietly(channel);
             channel = null;
@@ -553,6 +613,7 @@ public final class ChatClientController implements AutoCloseable {
     }
 
     private void authenticationFailed(String code, String message) {
+        stopKeepAlive();
         synchronized (lifecycleLock) {
             channel = null;
             identity = null;
@@ -632,8 +693,10 @@ public final class ChatClientController implements AutoCloseable {
             presenceByUsername.clear();
             pendingMessages.clear();
         }
+        stopKeepAlive();
         state = State.CLOSED;
         backgroundExecutor.shutdownNow();
+        scheduler.shutdownNow();
         dispatchUi(() -> listener.onStateChanged(State.CLOSED));
     }
 
@@ -704,6 +767,16 @@ public final class ChatClientController implements AutoCloseable {
         public Thread newThread(Runnable task) {
             Thread thread = new Thread(task,
                     "e2ee-client-worker-" + sequence.incrementAndGet());
+            thread.setDaemon(true);
+            return thread;
+        }
+    }
+
+    private static final class ClientSchedulerThreadFactory
+            implements ThreadFactory {
+        @Override
+        public Thread newThread(Runnable task) {
+            Thread thread = new Thread(task, "e2ee-client-scheduler");
             thread.setDaemon(true);
             return thread;
         }

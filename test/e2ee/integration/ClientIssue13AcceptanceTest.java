@@ -9,12 +9,14 @@ import e2ee.common.contract.PacketChannel;
 import e2ee.common.net.SocketPacketChannel;
 import e2ee.server.ServerMain;
 
+import javax.swing.SwingUtilities;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Nghiệm thu Issue #13 với hai ChatClientController qua Server TCP thật.
@@ -80,6 +82,30 @@ public final class ClientIssue13AcceptanceTest {
             bob = null;
             waitUntil(() -> !aliceListener.isOnline("bob"),
                     "Alice khong thay Bob offline");
+
+            alice.sendMessage("bob", "Tin nhan duoc dong bo khi online lai");
+            waitUntil(() -> server.getOfflineQueue().getQueueSize("bob") == 1,
+                    "Server khong luu tin nhan offline cua Bob");
+
+            bob = bobFiles.newController();
+            AcceptanceListener reconnectedBobListener =
+                    new AcceptanceListener();
+            bob.setListener(reconnectedBobListener);
+            bob.login("127.0.0.1", ServerMain.DEFAULT_PORT,
+                    "bob", bobPassphrase);
+            reconnectedBobListener.awaitAuthenticated();
+            reconnectedBobListener.awaitMessage();
+
+            TestSupport.assertEquals("alice",
+                    reconnectedBobListener.lastSender);
+            TestSupport.assertEquals(
+                    "Tin nhan duoc dong bo khi online lai",
+                    reconnectedBobListener.lastMessage);
+            TestSupport.assertTrue(
+                    reconnectedBobListener.messageCallbackOnEdt.get(),
+                    "Tin offline phai duoc hien thi qua callback tren EDT");
+            waitUntil(() -> server.getOfflineQueue().getQueueSize("bob") == 0,
+                    "Server khong xoa tin offline sau ACK DELIVERED");
         } finally {
             if (alice != null) {
                 alice.close();
@@ -135,6 +161,8 @@ public final class ClientIssue13AcceptanceTest {
         private final Map<String, Boolean> presence = new ConcurrentHashMap<>();
         private final Map<String, CountDownLatch> peerKeys =
                 new ConcurrentHashMap<>();
+        private final AtomicBoolean messageCallbackOnEdt =
+                new AtomicBoolean();
         private volatile String lastSender;
         private volatile String lastMessage;
 
@@ -158,6 +186,7 @@ public final class ClientIssue13AcceptanceTest {
         @Override
         public void onMessageReceived(String senderUsername, String content,
                 String messageId, long timestamp) {
+            messageCallbackOnEdt.set(SwingUtilities.isEventDispatchThread());
             lastSender = senderUsername;
             lastMessage = content;
             messageReceived.countDown();

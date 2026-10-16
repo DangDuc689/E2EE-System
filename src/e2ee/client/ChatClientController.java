@@ -2,6 +2,8 @@ package e2ee.client;
 
 import e2ee.client.crypto.ClientCryptoEngine;
 import e2ee.client.crypto.ClientCryptoService;
+import e2ee.client.crypto.GroupCryptoService;
+import e2ee.client.crypto.OfflineSyncService;
 import e2ee.client.identity.ClientIdentityStore;
 import e2ee.client.identity.ClientIdentityStore.Identity;
 import e2ee.client.security.LocalTrustStore;
@@ -46,6 +48,7 @@ public final class ChatClientController implements AutoCloseable {
     private final ClientIdentityStore identityStore;
     private final LocalTrustStore trustStore;
     private final ClientCryptoService cryptoService;
+    private final OfflineSyncService offlineSyncService;
     private final ChannelConnector channelConnector;
     private final ExecutorService backgroundExecutor;
     private final ScheduledExecutorService scheduler;
@@ -56,6 +59,8 @@ public final class ChatClientController implements AutoCloseable {
     private final ConcurrentMap<String, Boolean> presenceByUsername =
             new ConcurrentHashMap<>();
     private final ConcurrentMap<String, ArrayList<Envelope>> pendingMessages =
+            new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, ArrayList<Envelope>> pendingOfflineMessages =
             new ConcurrentHashMap<>();
 
     private volatile Listener listener = new Listener() {
@@ -108,6 +113,8 @@ public final class ChatClientController implements AutoCloseable {
                 trustStore, "trustStore cannot be null");
         this.cryptoService = Objects.requireNonNull(
                 cryptoService, "cryptoService cannot be null");
+        this.offlineSyncService = new OfflineSyncService(
+                this.cryptoService, GroupCryptoService.getDefault());
         this.channelConnector = Objects.requireNonNull(
                 channelConnector, "channelConnector cannot be null");
         if (keepAliveIntervalSeconds < 1) {
@@ -309,6 +316,7 @@ public final class ChatClientController implements AutoCloseable {
             peerPublicKeys.clear();
             presenceByUsername.clear();
             pendingMessages.clear();
+            pendingOfflineMessages.clear();
         }
         stopKeepAlive();
         stopReconnect();
@@ -476,6 +484,7 @@ public final class ChatClientController implements AutoCloseable {
             case KEY_LOOKUP_RESULT -> handleKeyLookupResult(envelope);
             case PRESENCE -> handlePresence(envelope);
             case CHAT_1TO1 -> handleIncomingChat(envelope);
+            case OFFLINE_SYNC -> handleOfflineSync(envelope);
             case PONG -> {
                 if (!"server".equals(envelope.getFrom())) {
                     dispatchError("INVALID_PONG", "PONG khong hop le");
@@ -526,6 +535,7 @@ public final class ChatClientController implements AutoCloseable {
             dispatchUi(() -> listener.onPeerKeyAvailable(
                     username, fingerprint, verified));
             processPendingMessages(username, publicKey);
+            processPendingOfflineMessages(username, publicKey);
         } catch (IOException | GeneralSecurityException
                 | IllegalArgumentException e) {
             dispatchError("INVALID_PUBLIC_KEY", e.getMessage());
@@ -594,6 +604,104 @@ public final class ChatClientController implements AutoCloseable {
                 dispatchUi(() -> listener.onSecurityWarning(
                         envelope.getFrom(), safeMessage(e.getMessage(),
                                 "Tin nhan khong an toan")));
+            }
+        });
+    }
+
+    private void handleOfflineSync(Envelope syncEnvelope) {
+        Identity currentIdentity = identity;
+        if (currentIdentity == null
+                || !"server".equals(syncEnvelope.getFrom())
+                || !currentIdentity.getUsername().equals(syncEnvelope.getTo())) {
+            dispatchError("INVALID_OFFLINE_SYNC",
+                    "OFFLINE_SYNC khong hop le");
+            return;
+        }
+
+        Envelope original;
+        try {
+            original = OfflineSyncService.extractOriginalEnvelope(syncEnvelope);
+        } catch (e2ee.common.json.JsonParseException
+                | IllegalArgumentException e) {
+            dispatchError("INVALID_OFFLINE_SYNC", e.getMessage());
+            return;
+        }
+
+        String senderUsername = original.getFrom();
+        if (original.getOp() != Opcode.CHAT_1TO1
+                || !isValidUsername(senderUsername)
+                || !currentIdentity.getUsername().equals(original.getTo())) {
+            dispatchError("INVALID_OFFLINE_SYNC",
+                    "Tin nhan goc trong OFFLINE_SYNC khong hop le");
+            return;
+        }
+
+        PublicKey senderKey = findPeerKey(senderUsername);
+        if (senderKey == null) {
+            ArrayList<Envelope> queue = pendingOfflineMessages.computeIfAbsent(
+                    senderUsername, ignored -> new ArrayList<>());
+            synchronized (queue) {
+                if (queue.size() >= MAX_PENDING_MESSAGES_PER_PEER) {
+                    dispatchError("PENDING_MESSAGE_LIMIT",
+                            "Qua nhieu tin offline dang cho public key");
+                    return;
+                }
+                queue.add(syncEnvelope);
+            }
+            lookupPeer(senderUsername);
+            return;
+        }
+
+        decryptOfflineMessage(syncEnvelope, senderKey, currentIdentity,
+                senderUsername);
+    }
+
+    private void processPendingOfflineMessages(String username,
+            PublicKey publicKey) {
+        ArrayList<Envelope> queue = pendingOfflineMessages.remove(username);
+        Identity currentIdentity = identity;
+        if (queue == null || currentIdentity == null) {
+            return;
+        }
+
+        ArrayList<Envelope> messages;
+        synchronized (queue) {
+            messages = new ArrayList<>(queue);
+            queue.clear();
+        }
+        for (Envelope pending : messages) {
+            decryptOfflineMessage(pending, publicKey, currentIdentity,
+                    username);
+        }
+    }
+
+    private void decryptOfflineMessage(Envelope syncEnvelope,
+            PublicKey senderKey, Identity currentIdentity,
+            String senderUsername) {
+        backgroundExecutor.execute(() -> {
+            try {
+                OfflineSyncService.SyncResult result =
+                        offlineSyncService.process1to1Message(
+                                syncEnvelope,
+                                currentIdentity.getUsername(), senderKey,
+                                currentIdentity.getPrivateKey());
+                Envelope original = result.getOriginalEnvelope();
+                dispatchUi(() -> {
+                    if (currentIdentity != identity
+                            || state != State.CONNECTED) {
+                        return;
+                    }
+                    listener.onMessageReceived(
+                            original.getFrom(), result.getDecryptedContent(),
+                            original.getId(), original.getTs());
+                    sendAsync(result.getAckEnvelope());
+                });
+            } catch (GeneralSecurityException
+                    | e2ee.common.json.JsonParseException
+                    | SecurityException | IllegalArgumentException e) {
+                dispatchUi(() -> listener.onSecurityWarning(
+                        senderUsername, safeMessage(e.getMessage(),
+                                "Tin nhan offline khong an toan")));
             }
         });
     }
@@ -841,6 +949,7 @@ public final class ChatClientController implements AutoCloseable {
             peerPublicKeys.clear();
             presenceByUsername.clear();
             pendingMessages.clear();
+            pendingOfflineMessages.clear();
         }
         stopKeepAlive();
         stopReconnect();

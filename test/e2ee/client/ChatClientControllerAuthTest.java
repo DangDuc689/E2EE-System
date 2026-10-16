@@ -11,6 +11,7 @@ import e2ee.common.contract.PacketChannel;
 import e2ee.common.stub.LoopbackChannel;
 
 import javax.swing.SwingUtilities;
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.KeyFactory;
@@ -22,6 +23,7 @@ import java.util.Base64;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
@@ -46,6 +48,8 @@ public final class ChatClientControllerAuthTest {
                 ChatClientControllerAuthTest::testInvalidNonceLength);
         TestSupport.check("CCC-A6 - Tu choi AUTH_CHALLENGE gia mao",
                 ChatClientControllerAuthTest::testInvalidChallengeSender);
+        TestSupport.check("CCC-A7 - Huy dang nhap dong kenh dang bat tay",
+                ChatClientControllerAuthTest::testDisconnectDuringHandshake);
 
         TestSupport.summary();
     }
@@ -218,12 +222,47 @@ public final class ChatClientControllerAuthTest {
         }
     }
 
+    private static void testDisconnectDuringHandshake() throws Exception {
+        TestContext context = TestContext.create();
+        char[] passphrase = "cancel-handshake-passphrase".toCharArray();
+        ChatClientController controller = null;
+        try {
+            context.identityStore.create("alice", passphrase);
+            BlockingHandshakeChannel blockingChannel =
+                    new BlockingHandshakeChannel();
+            controller = context.newController(
+                    (host, port, timeout) -> blockingChannel);
+            RecordingListener listener = new RecordingListener();
+            controller.setListener(listener);
+
+            controller.login("localhost", 8888, "alice", passphrase);
+            blockingChannel.awaitReceive();
+            controller.disconnect();
+            blockingChannel.awaitClosed();
+            SwingUtilities.invokeAndWait(() -> {
+            });
+
+            TestSupport.assertEquals(ChatClientController.State.DISCONNECTED,
+                    controller.getState());
+            TestSupport.assertTrue(!blockingChannel.isOpen(),
+                    "Kenh dang cho AUTH_CHALLENGE phai duoc dong");
+            TestSupport.assertEquals(0, listener.errorCount.get());
+        } finally {
+            if (controller != null) {
+                controller.close();
+            }
+            ClientCryptoEngine.wipeMemory(passphrase);
+            context.delete();
+        }
+    }
+
     private static final class RecordingListener
             implements ChatClientController.Listener {
         private final CountDownLatch authenticated = new CountDownLatch(1);
         private final CountDownLatch error = new CountDownLatch(1);
         private final AtomicBoolean authCallbackOnEdt = new AtomicBoolean();
         private final AtomicReference<String> errorCode = new AtomicReference<>();
+        private final AtomicInteger errorCount = new AtomicInteger();
 
         @Override
         public void onAuthenticated(String username) {
@@ -234,6 +273,7 @@ public final class ChatClientControllerAuthTest {
         @Override
         public void onError(String code, String message) {
             errorCode.set(code);
+            errorCount.incrementAndGet();
             error.countDown();
         }
 
@@ -247,6 +287,55 @@ public final class ChatClientControllerAuthTest {
             TestSupport.assertTrue(error.await(
                     TIMEOUT_SECONDS, TimeUnit.SECONDS),
                     "Khong nhan duoc callback error");
+        }
+    }
+
+    private static final class BlockingHandshakeChannel
+            implements PacketChannel {
+        private final CountDownLatch receiveEntered = new CountDownLatch(1);
+        private final CountDownLatch closed = new CountDownLatch(1);
+        private volatile boolean open = true;
+
+        @Override
+        public void send(Envelope envelope) throws IOException {
+            if (!open) {
+                throw new IOException("Kenh da dong");
+            }
+        }
+
+        @Override
+        public Envelope receive() throws IOException {
+            receiveEntered.countDown();
+            try {
+                closed.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Bi ngat khi cho", e);
+            }
+            throw new IOException("Kenh da dong");
+        }
+
+        @Override
+        public boolean isOpen() {
+            return open;
+        }
+
+        @Override
+        public void close() {
+            open = false;
+            closed.countDown();
+        }
+
+        private void awaitReceive() throws Exception {
+            TestSupport.assertTrue(receiveEntered.await(
+                    TIMEOUT_SECONDS, TimeUnit.SECONDS),
+                    "Controller chua cho AUTH_CHALLENGE");
+        }
+
+        private void awaitClosed() throws Exception {
+            TestSupport.assertTrue(closed.await(
+                    TIMEOUT_SECONDS, TimeUnit.SECONDS),
+                    "Kenh dang bat tay khong duoc dong");
         }
     }
 

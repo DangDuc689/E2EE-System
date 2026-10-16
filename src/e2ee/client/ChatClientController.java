@@ -67,12 +67,14 @@ public final class ChatClientController implements AutoCloseable {
     };
     private volatile State state = State.DISCONNECTED;
     private volatile PacketChannel channel;
+    private volatile PacketChannel connectingChannel;
     private volatile Identity identity;
     private volatile ScheduledFuture<?> keepAliveTask;
     private volatile ScheduledFuture<?> reconnectTask;
     private volatile String connectionHost;
     private volatile int connectionPort;
     private volatile int reconnectAttempt;
+    private long connectionAttempt;
     private volatile boolean closed;
 
     public ChatClientController(ClientIdentityStore identityStore,
@@ -253,7 +255,8 @@ public final class ChatClientController implements AutoCloseable {
             dispatchError("INVALID_INPUT", e.getMessage());
             return;
         }
-        if (!beginConnection()) {
+        long attempt = beginConnection();
+        if (attempt < 0) {
             ClientCryptoEngine.wipeMemory(passphraseCopy);
             return;
         }
@@ -262,10 +265,12 @@ public final class ChatClientController implements AutoCloseable {
             try {
                 Identity newIdentity = identityStore.create(
                         username, passphraseCopy);
-                connectAndAuthenticate(host, port, newIdentity, false);
+                connectAndAuthenticate(host, port, newIdentity, false,
+                        attempt);
             } catch (IOException | GeneralSecurityException
                     | IllegalArgumentException e) {
-                authenticationFailed("REGISTER_FAILED", e.getMessage());
+                authenticationFailed("REGISTER_FAILED", e.getMessage(),
+                        attempt);
             } finally {
                 ClientCryptoEngine.wipeMemory(passphraseCopy);
             }
@@ -285,7 +290,8 @@ public final class ChatClientController implements AutoCloseable {
             dispatchError("INVALID_INPUT", e.getMessage());
             return;
         }
-        if (!beginConnection()) {
+        long attempt = beginConnection();
+        if (attempt < 0) {
             ClientCryptoEngine.wipeMemory(passphraseCopy);
             return;
         }
@@ -294,10 +300,12 @@ public final class ChatClientController implements AutoCloseable {
             try {
                 Identity loadedIdentity = identityStore.load(
                         username, passphraseCopy);
-                connectAndAuthenticate(host, port, loadedIdentity, false);
+                connectAndAuthenticate(host, port, loadedIdentity, false,
+                        attempt);
             } catch (IOException | GeneralSecurityException
                     | IllegalArgumentException e) {
-                authenticationFailed("LOGIN_FAILED", e.getMessage());
+                authenticationFailed("LOGIN_FAILED", e.getMessage(),
+                        attempt);
             } finally {
                 ClientCryptoEngine.wipeMemory(passphraseCopy);
             }
@@ -306,9 +314,13 @@ public final class ChatClientController implements AutoCloseable {
 
     public void disconnect() {
         PacketChannel current;
+        PacketChannel connecting;
         synchronized (lifecycleLock) {
+            connectionAttempt++;
             current = channel;
+            connecting = connectingChannel;
             channel = null;
+            connectingChannel = null;
             identity = null;
             connectionHost = null;
             connectionPort = 0;
@@ -321,36 +333,46 @@ public final class ChatClientController implements AutoCloseable {
         stopKeepAlive();
         stopReconnect();
         closeQuietly(current);
+        if (connecting != current) {
+            closeQuietly(connecting);
+        }
         if (!closed) {
             setState(State.DISCONNECTED);
         }
     }
 
-    private boolean beginConnection() {
+    private long beginConnection() {
         synchronized (lifecycleLock) {
             if (closed) {
                 dispatchError("CLIENT_CLOSED", "Client da dong");
-                return false;
+                return -1L;
             }
             if (state != State.DISCONNECTED) {
                 dispatchError("CONNECTION_BUSY",
                         "Client dang ket noi hoac da dang nhap");
-                return false;
+                return -1L;
             }
+            connectionAttempt++;
             setState(State.CONNECTING);
-            return true;
+            return connectionAttempt;
         }
     }
 
     private void connectAndAuthenticate(String host, int port,
-            Identity candidateIdentity, boolean reconnecting) {
+            Identity candidateIdentity, boolean reconnecting, long attempt) {
         PacketChannel candidateChannel = null;
         try {
             validateEndpoint(host, port);
             candidateChannel = channelConnector.connect(
                     host.trim(), port, DEFAULT_CONNECT_TIMEOUT_MS);
-            if (!reconnecting) {
-                setState(State.AUTHENTICATING);
+            synchronized (lifecycleLock) {
+                if (closed || attempt != connectionAttempt) {
+                    throw new ConnectionCancelledException();
+                }
+                connectingChannel = candidateChannel;
+                if (!reconnecting) {
+                    setState(State.AUTHENTICATING);
+                }
             }
 
             Envelope challenge = candidateChannel.receive();
@@ -414,9 +436,11 @@ public final class ChatClientController implements AutoCloseable {
             }
 
             synchronized (lifecycleLock) {
-                if (closed) {
-                    throw new IOException("Client da dong");
+                if (closed || attempt != connectionAttempt
+                        || connectingChannel != candidateChannel) {
+                    throw new ConnectionCancelledException();
                 }
+                connectingChannel = null;
                 channel = candidateChannel;
                 identity = candidateIdentity;
                 connectionHost = host.trim();
@@ -434,17 +458,39 @@ public final class ChatClientController implements AutoCloseable {
                         candidateIdentity.getUsername()));
             }
             receiveLoop(candidateChannel);
-        } catch (AuthenticationException e) {
+        } catch (ConnectionCancelledException e) {
             closeQuietly(candidateChannel);
-            authenticationFailed(e.code, e.getMessage());
+        } catch (AuthenticationException e) {
+            clearConnectingChannel(candidateChannel);
+            closeQuietly(candidateChannel);
+            authenticationFailed(e.code, e.getMessage(), attempt);
         } catch (IOException | GeneralSecurityException
                 | IllegalArgumentException e) {
+            clearConnectingChannel(candidateChannel);
             closeQuietly(candidateChannel);
-            if (reconnecting && !closed) {
+            if (!isCurrentAttempt(attempt)) {
+                return;
+            }
+            if (reconnecting) {
                 scheduleReconnect(e.getMessage());
             } else {
-                authenticationFailed("CONNECTION_FAILED", e.getMessage());
+                authenticationFailed("CONNECTION_FAILED", e.getMessage(),
+                        attempt);
             }
+        }
+    }
+
+    private void clearConnectingChannel(PacketChannel candidateChannel) {
+        synchronized (lifecycleLock) {
+            if (connectingChannel == candidateChannel) {
+                connectingChannel = null;
+            }
+        }
+    }
+
+    private boolean isCurrentAttempt(long attempt) {
+        synchronized (lifecycleLock) {
+            return !closed && attempt == connectionAttempt;
         }
     }
 
@@ -842,11 +888,16 @@ public final class ChatClientController implements AutoCloseable {
                 attempt, delayMs,
                 safeMessage(failureMessage, "Mat ket noi Server")));
         reconnectTask = scheduler.schedule(() -> {
-            if (closed || state != State.RECONNECTING) {
-                return;
+            long connectionToken;
+            synchronized (lifecycleLock) {
+                if (closed || state != State.RECONNECTING) {
+                    return;
+                }
+                connectionAttempt++;
+                connectionToken = connectionAttempt;
             }
             backgroundExecutor.execute(() -> connectAndAuthenticate(
-                    host, port, reconnectIdentity, true));
+                    host, port, reconnectIdentity, true, connectionToken));
         }, delayMs, TimeUnit.MILLISECONDS);
     }
 
@@ -865,9 +916,14 @@ public final class ChatClientController implements AutoCloseable {
         }
     }
 
-    private void authenticationFailed(String code, String message) {
+    private void authenticationFailed(String code, String message,
+            long attempt) {
         stopKeepAlive();
         synchronized (lifecycleLock) {
+            if (closed || attempt != connectionAttempt) {
+                return;
+            }
+            connectingChannel = null;
             channel = null;
             identity = null;
             connectionHost = null;
@@ -943,6 +999,9 @@ public final class ChatClientController implements AutoCloseable {
                 return;
             }
             closed = true;
+            connectionAttempt++;
+            closeQuietly(connectingChannel);
+            connectingChannel = null;
             closeQuietly(channel);
             channel = null;
             identity = null;
@@ -1024,6 +1083,10 @@ public final class ChatClientController implements AutoCloseable {
             super(safeMessage(message, "Xac thuc that bai"));
             this.code = safeMessage(code, "AUTH_FAILED");
         }
+    }
+
+    private static final class ConnectionCancelledException
+            extends IOException {
     }
 
     private static final class ClientThreadFactory implements ThreadFactory {

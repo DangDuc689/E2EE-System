@@ -93,6 +93,12 @@ public class ClientMain {
         }
 
         @Override
+        public void onSendMessage(String username, String content,
+                int ttlSeconds) {
+            controller.sendMessage(username, content, ttlSeconds);
+        }
+
+        @Override
         public void onOpenSecurity(String username) {
             controller.requestFingerprintDetails(username);
         }
@@ -192,9 +198,17 @@ public class ClientMain {
         @Override
         public void onMessageSent(String recipientUsername, String content,
                 String messageId, long timestamp) {
+            onMessageSentWithTtl(recipientUsername, content,
+                    messageId, timestamp, 0);
+        }
+
+        @Override
+        public void onMessageSentWithTtl(String recipientUsername,
+                String content, String messageId, long timestamp,
+                int ttlSeconds) {
             if (chatFrame != null) {
                 chatFrame.addMessage(recipientUsername,
-                        content, timestamp, true);
+                        content, timestamp, true, ttlSeconds);
             }
         }
 

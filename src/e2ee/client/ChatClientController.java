@@ -196,6 +196,15 @@ public final class ChatClientController implements AutoCloseable {
      * Mã hóa và gửi một tin nhắn 1-1 trên luồng nền.
      */
     public void sendMessage(String recipientUsername, String content) {
+        sendMessage(recipientUsername, content, 0);
+    }
+
+    /**
+     * Mã hóa và gửi tin nhắn với TTL hiển thị cục bộ tùy chọn.
+     * TTL bằng 0 nghĩa là giữ lại; payload mạng vẫn giữ nguyên contract.
+     */
+    public void sendMessage(String recipientUsername, String content,
+            int ttlSeconds) {
         if (!isValidUsername(recipientUsername)) {
             dispatchError("INVALID_RECIPIENT",
                     "Username nguoi nhan khong hop le");
@@ -203,6 +212,10 @@ public final class ChatClientController implements AutoCloseable {
         }
         if (content == null || content.isBlank()) {
             dispatchError("EMPTY_MESSAGE", "Tin nhan khong duoc de trong");
+            return;
+        }
+        if (ttlSeconds < 0 || ttlSeconds > 86_400) {
+            dispatchError("INVALID_TTL", "TTL khong hop le");
             return;
         }
         if (blockedPeers.contains(recipientUsername)) {
@@ -238,9 +251,9 @@ public final class ChatClientController implements AutoCloseable {
                     return;
                 }
                 currentChannel.send(encrypted);
-                dispatchUi(() -> listener.onMessageSent(
+                dispatchUi(() -> listener.onMessageSentWithTtl(
                         recipientUsername, content, encrypted.getId(),
-                        encrypted.getTs()));
+                        encrypted.getTs(), ttlSeconds));
             } catch (GeneralSecurityException e) {
                 dispatchError("ENCRYPT_FAILED", e.getMessage());
             } catch (IOException e) {
@@ -497,7 +510,6 @@ public final class ChatClientController implements AutoCloseable {
             } catch (IllegalArgumentException e) {
                 throw new IOException("Nonce Base64 khong hop le", e);
             }
-
             if (nonce.length != 32) {
                 ClientCryptoEngine.wipeMemory(nonce);
                 throw new IOException("AUTH_CHALLENGE nonce phai dung 32 byte");
@@ -1227,6 +1239,12 @@ public final class ChatClientController implements AutoCloseable {
 
         default void onMessageSent(String recipientUsername, String content,
                 String messageId, long timestamp) {
+        }
+
+        default void onMessageSentWithTtl(String recipientUsername,
+                String content, String messageId, long timestamp,
+                int ttlSeconds) {
+            onMessageSent(recipientUsername, content, messageId, timestamp);
         }
 
         default void onMessageReceived(String senderUsername, String content,

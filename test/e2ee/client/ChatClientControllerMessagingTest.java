@@ -18,6 +18,7 @@ import java.security.KeyPair;
 import java.security.PublicKey;
 import java.security.SecureRandom;
 import java.util.Base64;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -44,6 +45,8 @@ public final class ChatClientControllerMessagingTest {
                 ChatClientControllerMessagingTest::testTamperedMessage);
         TestSupport.check("CCC-M5 - Tin offline lap lai van gui ACK",
                 ChatClientControllerMessagingTest::testOfflineRetryAck);
+        TestSupport.check("CCC-M6 - TTL cuc bo khong doi contract mang",
+                ChatClientControllerMessagingTest::testMessageTtl);
 
         TestSupport.summary();
     }
@@ -187,6 +190,30 @@ public final class ChatClientControllerMessagingTest {
         }
     }
 
+    private static void testMessageTtl() throws Exception {
+        TestContext context = TestContext.create();
+        KeyPair bob = ClientCryptoEngine.generateRsaKeyPair();
+        context.trustStore.checkPeerKey("bob", encodePublicKey(bob));
+        Session session = context.openSession();
+        try {
+            session.controller.sendMessage("bob", "Tu huy 10 giay", 10);
+            Envelope outgoing = session.server.serverChannel.receive();
+            session.listener.awaitSent();
+            String sentMessage = new ClientCryptoService()
+                    .verifyAndDecrypt1to1Message(
+                            outgoing,
+                            session.server.alicePublicKey.get(),
+                            bob.getPrivate(), false);
+            TestSupport.assertEquals("Tu huy 10 giay", sentMessage);
+            TestSupport.assertEquals(10, session.listener.sentTtl.get());
+            TestSupport.assertEquals(Set.of("ek", "iv", "ct", "sig"),
+                    outgoing.getBody().keySet());
+        } finally {
+            session.close();
+            context.delete();
+        }
+    }
+
     private static void assertDeliveredAck(Envelope ack,
             String expectedMessageId) {
         TestSupport.assertEquals(Opcode.ACK, ack.getOp());
@@ -212,6 +239,7 @@ public final class ChatClientControllerMessagingTest {
         private final AtomicReference<String> receivedContent = new AtomicReference<>();
         private final AtomicBoolean receivedOnEdt = new AtomicBoolean();
         private final AtomicInteger receivedCount = new AtomicInteger();
+        private final AtomicInteger sentTtl = new AtomicInteger();
 
         @Override
         public void onAuthenticated(String username) {
@@ -219,8 +247,10 @@ public final class ChatClientControllerMessagingTest {
         }
 
         @Override
-        public void onMessageSent(String recipientUsername, String content,
-                String messageId, long timestamp) {
+        public void onMessageSentWithTtl(String recipientUsername,
+                String content, String messageId, long timestamp,
+                int ttlSeconds) {
+            sentTtl.set(ttlSeconds);
             sent.countDown();
         }
 

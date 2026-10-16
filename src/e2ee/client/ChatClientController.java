@@ -14,6 +14,7 @@ import javax.swing.SwingUtilities;
 import java.io.IOException;
 import java.security.GeneralSecurityException;
 import java.security.PublicKey;
+import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collections;
 import java.util.HashMap;
@@ -32,6 +33,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 public final class ChatClientController implements AutoCloseable {
     public static final int DEFAULT_CONNECT_TIMEOUT_MS = 5_000;
+    private static final int MAX_PENDING_MESSAGES_PER_PEER = 100;
 
     private final Object lifecycleLock = new Object();
     private final ClientIdentityStore identityStore;
@@ -42,6 +44,8 @@ public final class ChatClientController implements AutoCloseable {
     private final ConcurrentMap<String, PublicKey> peerPublicKeys =
             new ConcurrentHashMap<>();
     private final ConcurrentMap<String, Boolean> presenceByUsername =
+            new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, ArrayList<Envelope>> pendingMessages =
             new ConcurrentHashMap<>();
 
     private volatile Listener listener = new Listener() {
@@ -122,6 +126,60 @@ public final class ChatClientController implements AutoCloseable {
     }
 
     /**
+     * Mã hóa và gửi một tin nhắn 1-1 trên luồng nền.
+     */
+    public void sendMessage(String recipientUsername, String content) {
+        if (!isValidUsername(recipientUsername)) {
+            dispatchError("INVALID_RECIPIENT",
+                    "Username nguoi nhan khong hop le");
+            return;
+        }
+        if (content == null || content.isBlank()) {
+            dispatchError("EMPTY_MESSAGE", "Tin nhan khong duoc de trong");
+            return;
+        }
+
+        Identity currentIdentity = identity;
+        PacketChannel currentChannel = channel;
+        if (state != State.CONNECTED || currentIdentity == null
+                || currentChannel == null) {
+            dispatchError("NOT_CONNECTED", "Client chua ket noi");
+            return;
+        }
+
+        PublicKey recipientKey = findPeerKey(recipientUsername);
+        if (recipientKey == null) {
+            lookupPeer(recipientUsername);
+            dispatchError("PEER_KEY_UNAVAILABLE",
+                    "Chua co public key cua ban chat");
+            return;
+        }
+
+        backgroundExecutor.execute(() -> {
+            try {
+                Envelope encrypted = cryptoService.createEncrypted1to1Message(
+                        currentIdentity.getUsername(), recipientUsername,
+                        content, recipientKey,
+                        currentIdentity.getPrivateKey());
+                if (currentChannel != channel || !currentChannel.isOpen()) {
+                    dispatchError("NOT_CONNECTED", "Client da mat ket noi");
+                    return;
+                }
+                currentChannel.send(encrypted);
+                dispatchUi(() -> listener.onMessageSent(
+                        recipientUsername, content, encrypted.getId(),
+                        encrypted.getTs()));
+            } catch (GeneralSecurityException e) {
+                dispatchError("ENCRYPT_FAILED", e.getMessage());
+            } catch (IOException e) {
+                if (currentChannel == channel) {
+                    connectionLost(e.getMessage());
+                }
+            }
+        });
+    }
+
+    /**
      * Tạo cặp khóa mới, lưu cục bộ rồi kết nối và xác thực.
      */
     public void register(String host, int port, String username,
@@ -193,6 +251,7 @@ public final class ChatClientController implements AutoCloseable {
             identity = null;
             peerPublicKeys.clear();
             presenceByUsername.clear();
+            pendingMessages.clear();
         }
         closeQuietly(current);
         if (!closed) {
@@ -314,6 +373,7 @@ public final class ChatClientController implements AutoCloseable {
                     envelope.getString("msg"));
             case KEY_LOOKUP_RESULT -> handleKeyLookupResult(envelope);
             case PRESENCE -> handlePresence(envelope);
+            case CHAT_1TO1 -> handleIncomingChat(envelope);
             default -> {
                 // Các opcode chat, keep-alive và offline được xử lý ở lát cắt sau.
             }
@@ -346,9 +406,97 @@ public final class ChatClientController implements AutoCloseable {
             boolean verified = trustStore.isVerified(username);
             dispatchUi(() -> listener.onPeerKeyAvailable(
                     username, fingerprint, verified));
+            processPendingMessages(username, publicKey);
         } catch (IOException | GeneralSecurityException
                 | IllegalArgumentException e) {
             dispatchError("INVALID_PUBLIC_KEY", e.getMessage());
+        }
+    }
+
+    private void handleIncomingChat(Envelope envelope) {
+        Identity currentIdentity = identity;
+        String senderUsername = envelope.getFrom();
+        if (currentIdentity == null
+                || !isValidUsername(senderUsername)
+                || !currentIdentity.getUsername().equals(envelope.getTo())) {
+            dispatchError("INVALID_CHAT", "CHAT_1TO1 khong hop le");
+            return;
+        }
+
+        PublicKey senderKey = findPeerKey(senderUsername);
+        if (senderKey == null) {
+            ArrayList<Envelope> queue = pendingMessages.computeIfAbsent(
+                    senderUsername, ignored -> new ArrayList<>());
+            synchronized (queue) {
+                if (queue.size() >= MAX_PENDING_MESSAGES_PER_PEER) {
+                    dispatchError("PENDING_MESSAGE_LIMIT",
+                            "Qua nhieu tin dang cho public key");
+                    return;
+                }
+                queue.add(envelope);
+            }
+            lookupPeer(senderUsername);
+            return;
+        }
+
+        decryptIncomingMessage(envelope, senderKey, currentIdentity);
+    }
+
+    private void processPendingMessages(String username, PublicKey publicKey) {
+        ArrayList<Envelope> queue = pendingMessages.remove(username);
+        Identity currentIdentity = identity;
+        if (queue == null || currentIdentity == null) {
+            return;
+        }
+
+        ArrayList<Envelope> messages;
+        synchronized (queue) {
+            messages = new ArrayList<>(queue);
+            queue.clear();
+        }
+        for (Envelope pending : messages) {
+            decryptIncomingMessage(pending, publicKey, currentIdentity);
+        }
+    }
+
+    private void decryptIncomingMessage(Envelope envelope,
+            PublicKey senderKey, Identity currentIdentity) {
+        backgroundExecutor.execute(() -> {
+            try {
+                String content = cryptoService.verifyAndDecrypt1to1Message(
+                        envelope, senderKey,
+                        currentIdentity.getPrivateKey(), false);
+                dispatchUi(() -> listener.onMessageReceived(
+                        envelope.getFrom(), content,
+                        envelope.getId(), envelope.getTs()));
+            } catch (GeneralSecurityException
+                    | e2ee.common.json.JsonParseException
+                    | SecurityException e) {
+                dispatchUi(() -> listener.onSecurityWarning(
+                        envelope.getFrom(), safeMessage(e.getMessage(),
+                                "Tin nhan khong an toan")));
+            }
+        });
+    }
+
+    private PublicKey findPeerKey(String username) {
+        PublicKey cached = peerPublicKeys.get(username);
+        if (cached != null) {
+            return cached;
+        }
+
+        String storedKey = trustStore.getPublicKeyBase64(username);
+        if (storedKey == null) {
+            return null;
+        }
+        try {
+            PublicKey decoded = decodePublicKey(storedKey);
+            PublicKey existing = peerPublicKeys.putIfAbsent(
+                    username, decoded);
+            return existing != null ? existing : decoded;
+        } catch (GeneralSecurityException e) {
+            dispatchError("INVALID_PUBLIC_KEY", e.getMessage());
+            return null;
         }
     }
 
@@ -482,6 +630,7 @@ public final class ChatClientController implements AutoCloseable {
             identity = null;
             peerPublicKeys.clear();
             presenceByUsername.clear();
+            pendingMessages.clear();
         }
         state = State.CLOSED;
         backgroundExecutor.shutdownNow();
@@ -519,6 +668,17 @@ public final class ChatClientController implements AutoCloseable {
         }
 
         default void onPresenceChanged(String username, boolean online) {
+        }
+
+        default void onMessageSent(String recipientUsername, String content,
+                String messageId, long timestamp) {
+        }
+
+        default void onMessageReceived(String senderUsername, String content,
+                String messageId, long timestamp) {
+        }
+
+        default void onSecurityWarning(String username, String message) {
         }
     }
 

@@ -31,7 +31,7 @@ public final class LoginFrame extends JFrame {
     private static final Color ERROR = new Color(185, 28, 28);
     private static final Color MUTED = new Color(100, 116, 139);
 
-    private final JTextField hostField = new JTextField("127.0.0.1", 18);
+    private final JTextField hostField = new JTextField(18);
     private final JSpinner portSpinner = new JSpinner(
             new SpinnerNumberModel(8888, 1, 65_535, 1));
     private final JTextField usernameField = new JTextField(18);

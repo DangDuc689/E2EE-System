@@ -346,9 +346,11 @@ public final class ChatClientController implements AutoCloseable {
             }
 
             Envelope challenge = candidateChannel.receive();
-            if (challenge.getOp() != Opcode.AUTH_CHALLENGE) {
+            if (challenge.getOp() != Opcode.AUTH_CHALLENGE
+                    || !"server".equals(challenge.getFrom())
+                    || challenge.getTo() != null) {
                 throw new IOException(
-                        "Server khong gui AUTH_CHALLENGE dau tien");
+                        "AUTH_CHALLENGE co header khong hop le");
             }
             String nonceBase64 = challenge.getString("nonce");
             if (nonceBase64 == null || nonceBase64.isBlank()) {
@@ -383,7 +385,18 @@ public final class ChatClientController implements AutoCloseable {
             }
 
             Envelope response = candidateChannel.receive();
+            if (!"server".equals(response.getFrom())
+                    || !candidateIdentity.getUsername().equals(
+                            response.getTo())) {
+                throw new IOException("Phan hoi AUTH co header khong hop le");
+            }
             if (response.getOp() == Opcode.ERROR) {
+                if (response.getString("code") == null
+                        || response.getString("code").isBlank()
+                        || response.getString("msg") == null
+                        || response.getString("msg").isBlank()) {
+                    throw new IOException("ERROR xac thuc khong hop le");
+                }
                 throw new AuthenticationException(
                         response.getString("code"),
                         response.getString("msg"));
@@ -447,19 +460,40 @@ public final class ChatClientController implements AutoCloseable {
             return;
         }
 
+        Identity currentIdentity = identity;
+        if (currentIdentity == null
+                || !currentIdentity.getUsername().equals(envelope.getTo())) {
+            dispatchError("INVALID_ENVELOPE",
+                    "Goi tin khong gui dung nguoi nhan");
+            return;
+        }
+
         switch (envelope.getOp()) {
-            case ERROR -> dispatchError(envelope.getString("code"),
-                    envelope.getString("msg"));
+            case ERROR -> handleError(envelope);
             case KEY_LOOKUP_RESULT -> handleKeyLookupResult(envelope);
             case PRESENCE -> handlePresence(envelope);
             case CHAT_1TO1 -> handleIncomingChat(envelope);
             case PONG -> {
-                // PONG xác nhận kết nối còn sống; không cần cập nhật giao diện.
+                if (!"server".equals(envelope.getFrom())) {
+                    dispatchError("INVALID_PONG", "PONG khong hop le");
+                }
             }
             default -> {
                 // Các opcode chat, keep-alive và offline được xử lý ở lát cắt sau.
             }
         }
+    }
+
+    private void handleError(Envelope envelope) {
+        String code = envelope.getString("code");
+        String message = envelope.getString("msg");
+        if (!"server".equals(envelope.getFrom())
+                || code == null || code.isBlank()
+                || message == null || message.isBlank()) {
+            dispatchError("INVALID_ERROR", "ERROR khong hop le");
+            return;
+        }
+        dispatchError(code, message);
     }
 
     private void handleKeyLookupResult(Envelope envelope) {
@@ -585,7 +619,8 @@ public final class ChatClientController implements AutoCloseable {
     private void handlePresence(Envelope envelope) {
         Object onlineValue = envelope.get("online");
         String username = envelope.getString("user");
-        if (!isValidUsername(username)
+        if (!"server".equals(envelope.getFrom())
+                || !isValidUsername(username)
                 || !(onlineValue instanceof Boolean online)) {
             dispatchError("INVALID_PRESENCE", "PRESENCE khong hop le");
             return;

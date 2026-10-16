@@ -37,6 +37,8 @@ public final class ChatClientControllerDirectoryTest {
                 ChatClientControllerDirectoryTest::testChangedKey);
         TestSupport.check("CCC-D3 - PRESENCE cap nhat tren EDT",
                 ChatClientControllerDirectoryTest::testPresence);
+        TestSupport.check("CCC-D4 - Tu choi PRESENCE gia mao",
+                ChatClientControllerDirectoryTest::testForgedPresence);
 
         TestSupport.summary();
     }
@@ -159,6 +161,42 @@ public final class ChatClientControllerDirectoryTest {
         }
     }
 
+    private static void testForgedPresence() throws Exception {
+        TestContext context = TestContext.create();
+        char[] passphrase = "forged-presence-passphrase".toCharArray();
+        DirectoryServer server = null;
+        ChatClientController controller = null;
+        try {
+            context.identityStore.create("alice", passphrase);
+            server = new DirectoryServer("alice");
+            controller = context.newController(server.clientChannel);
+            DirectoryListener listener = new DirectoryListener();
+            controller.setListener(listener);
+            controller.login("localhost", 8888, "alice", passphrase);
+            listener.awaitAuthenticated();
+
+            server.serverChannel.send(Envelope.create(
+                    Opcode.PRESENCE, "mallory", "alice")
+                    .put("user", "bob")
+                    .put("online", true));
+            listener.awaitError();
+
+            TestSupport.assertEquals("INVALID_PRESENCE",
+                    listener.errorCode.get());
+            TestSupport.assertTrue(!controller.isPeerOnline("bob"),
+                    "Presence gia mao khong duoc cap nhat trang thai");
+        } finally {
+            if (controller != null) {
+                controller.close();
+            }
+            if (server != null) {
+                server.close();
+            }
+            ClientCryptoEngine.wipeMemory(passphrase);
+            context.delete();
+        }
+    }
+
     private static String encodePublicKey(KeyPair keyPair) {
         return Base64.getEncoder().encodeToString(
                 keyPair.getPublic().getEncoded());
@@ -170,9 +208,11 @@ public final class ChatClientControllerDirectoryTest {
         private final CountDownLatch keyAvailable = new CountDownLatch(1);
         private final CountDownLatch keyMismatch = new CountDownLatch(1);
         private final CountDownLatch presence = new CountDownLatch(1);
+        private final CountDownLatch error = new CountDownLatch(1);
         private final AtomicBoolean keyCallbackOnEdt = new AtomicBoolean();
         private final AtomicBoolean presenceCallbackOnEdt = new AtomicBoolean();
         private final AtomicReference<String> mismatchUser = new AtomicReference<>();
+        private final AtomicReference<String> errorCode = new AtomicReference<>();
 
         @Override
         public void onAuthenticated(String username) {
@@ -199,6 +239,12 @@ public final class ChatClientControllerDirectoryTest {
             presence.countDown();
         }
 
+        @Override
+        public void onError(String code, String message) {
+            errorCode.set(code);
+            error.countDown();
+        }
+
         private void awaitAuthenticated() throws Exception {
             await(authenticated, "authenticated");
         }
@@ -213,6 +259,10 @@ public final class ChatClientControllerDirectoryTest {
 
         private void awaitPresence() throws Exception {
             await(presence, "presence");
+        }
+
+        private void awaitError() throws Exception {
+            await(error, "error");
         }
 
         private static void await(CountDownLatch latch, String name)

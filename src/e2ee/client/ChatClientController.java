@@ -340,12 +340,14 @@ public final class ChatClientController implements AutoCloseable {
                 }
                 trustStore.markVerified(username);
                 String trustedKey = trustStore.getPublicKeyBase64(username);
-                peerPublicKeys.put(username, decodePublicKey(trustedKey));
+                PublicKey trustedPublicKey = decodePublicKey(trustedKey);
+                peerPublicKeys.put(username, trustedPublicKey);
                 pendingChangedKeys.remove(username);
                 blockedPeers.remove(username);
                 String fingerprint = trustStore.getFingerprint(username);
                 dispatchUi(() -> listener.onPeerTrustRestored(
                         username, fingerprint));
+                processPendingOfflineMessages(username, trustedPublicKey);
             } catch (IOException | GeneralSecurityException
                     | IllegalArgumentException e) {
                 dispatchError("TRUST_UPDATE_FAILED", e.getMessage());
@@ -740,7 +742,6 @@ public final class ChatClientController implements AutoCloseable {
             blockedPeers.add(username);
             peerPublicKeys.remove(username);
             pendingMessages.remove(username);
-            pendingOfflineMessages.remove(username);
             dispatchUi(() -> listener.onPeerKeyMismatch(
                     username, newPublicKeyBase64));
         } catch (GeneralSecurityException e) {
@@ -852,6 +853,7 @@ public final class ChatClientController implements AutoCloseable {
             return;
         }
         if (blockedPeers.contains(senderUsername)) {
+            queuePendingOfflineMessage(senderUsername, syncEnvelope);
             dispatchUi(() -> listener.onSecurityWarning(senderUsername,
                     "Da chan tin offline vi public key dang bi thay doi"));
             return;
@@ -859,22 +861,29 @@ public final class ChatClientController implements AutoCloseable {
 
         PublicKey senderKey = findPeerKey(senderUsername);
         if (senderKey == null) {
-            ArrayList<Envelope> queue = pendingOfflineMessages.computeIfAbsent(
-                    senderUsername, ignored -> new ArrayList<>());
-            synchronized (queue) {
-                if (queue.size() >= MAX_PENDING_MESSAGES_PER_PEER) {
-                    dispatchError("PENDING_MESSAGE_LIMIT",
-                            "Qua nhieu tin offline dang cho public key");
-                    return;
-                }
-                queue.add(syncEnvelope);
+            if (queuePendingOfflineMessage(senderUsername, syncEnvelope)) {
+                lookupPeer(senderUsername);
             }
-            lookupPeer(senderUsername);
             return;
         }
 
         decryptOfflineMessage(syncEnvelope, senderKey, currentIdentity,
                 senderUsername);
+    }
+
+    private boolean queuePendingOfflineMessage(String username,
+            Envelope syncEnvelope) {
+        ArrayList<Envelope> queue = pendingOfflineMessages.computeIfAbsent(
+                username, ignored -> new ArrayList<>());
+        synchronized (queue) {
+            if (queue.size() >= MAX_PENDING_MESSAGES_PER_PEER) {
+                dispatchError("PENDING_MESSAGE_LIMIT",
+                        "Qua nhieu tin offline dang cho public key");
+                return false;
+            }
+            queue.add(syncEnvelope);
+            return true;
+        }
     }
 
     private void processPendingOfflineMessages(String username,

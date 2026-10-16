@@ -5,6 +5,7 @@ import e2ee.client.crypto.ClientCryptoService;
 import e2ee.client.identity.ClientIdentityStore;
 import e2ee.client.security.LocalTrustStore;
 import e2ee.common.TestSupport;
+import e2ee.common.codec.EnvelopeMapper;
 import e2ee.common.contract.Envelope;
 import e2ee.common.contract.Opcode;
 import e2ee.common.contract.PacketChannel;
@@ -75,6 +76,18 @@ public final class ChatClientControllerTrustTest {
             TestSupport.assertEquals(oldKey,
                     trustStore.getPublicKeyBase64("bob"));
 
+            ClientIdentityStore.Identity aliceIdentity =
+                    identityStore.load("alice", passphrase);
+            Envelope offlineMessage = new ClientCryptoService()
+                    .createEncrypted1to1Message(
+                            "bob", "alice", "Tin offline sau khi doi khoa",
+                            aliceIdentity.getPublicKey(),
+                            changedKeyPair.getPrivate());
+            channels[1].send(Envelope.create(
+                    Opcode.OFFLINE_SYNC, "server", "alice")
+                    .put("original_envelope",
+                            EnvelopeMapper.toMap(offlineMessage)));
+
             controller.requestFingerprintDetails("bob");
             listener.await(listener.fingerprintDetails,
                     "fingerprint details");
@@ -104,6 +117,21 @@ public final class ChatClientControllerTrustTest {
                     trustStore.getPublicKeyBase64("bob"));
             TestSupport.assertTrue(trustStore.isVerified("bob"),
                     "Khoa moi phai duoc danh dau da xac minh");
+            listener.await(listener.messageReceived,
+                    "offline message after trust restored");
+            TestSupport.assertEquals("Tin offline sau khi doi khoa",
+                    listener.messageContent.get());
+            TestSupport.assertTrue(listener.messageOnEdt.get(),
+                    "Tin offline phai duoc dua len UI tren EDT");
+
+            Envelope ack = channels[1].receive();
+            TestSupport.assertEquals(Opcode.ACK, ack.getOp());
+            TestSupport.assertEquals("alice", ack.getFrom());
+            TestSupport.assertEquals("server", ack.getTo());
+            TestSupport.assertEquals(offlineMessage.getId(),
+                    ack.getString("ack_msg_id"));
+            TestSupport.assertEquals("DELIVERED",
+                    ack.getString("status"));
         } finally {
             if (controller != null) {
                 controller.close();
@@ -156,6 +184,7 @@ public final class ChatClientControllerTrustTest {
                 new CountDownLatch(1);
         private final CountDownLatch trustRestored = new CountDownLatch(1);
         private final CountDownLatch trustRejected = new CountDownLatch(1);
+        private final CountDownLatch messageReceived = new CountDownLatch(1);
         private final AtomicBoolean mismatchOnEdt = new AtomicBoolean();
         private final AtomicBoolean restoredOnEdt = new AtomicBoolean();
         private final AtomicBoolean keyChanged = new AtomicBoolean();
@@ -163,6 +192,9 @@ public final class ChatClientControllerTrustTest {
                 new AtomicReference<>();
         private final AtomicReference<String> errorCode =
                 new AtomicReference<>();
+        private final AtomicReference<String> messageContent =
+                new AtomicReference<>();
+        private final AtomicBoolean messageOnEdt = new AtomicBoolean();
 
         @Override
         public void onAuthenticated(String username) {
@@ -190,6 +222,14 @@ public final class ChatClientControllerTrustTest {
                 String fingerprint) {
             restoredOnEdt.set(SwingUtilities.isEventDispatchThread());
             trustRestored.countDown();
+        }
+
+        @Override
+        public void onMessageReceived(String senderUsername, String content,
+                String messageId, long timestamp) {
+            messageContent.set(content);
+            messageOnEdt.set(SwingUtilities.isEventDispatchThread());
+            messageReceived.countDown();
         }
 
         @Override

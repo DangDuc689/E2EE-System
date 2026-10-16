@@ -1,5 +1,6 @@
-package e2ee.client;
+package e2ee.integration;
 
+import e2ee.client.ChatClientController;
 import e2ee.client.crypto.ClientCryptoEngine;
 import e2ee.client.identity.ClientIdentityStore;
 import e2ee.client.security.LocalTrustStore;

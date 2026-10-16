@@ -38,6 +38,9 @@ public final class ChatClientController implements AutoCloseable {
     public static final int DEFAULT_CONNECT_TIMEOUT_MS = 5_000;
     public static final long KEEP_ALIVE_INTERVAL_SECONDS = 30L;
     private static final int MAX_PENDING_MESSAGES_PER_PEER = 100;
+    private static final long[] DEFAULT_RECONNECT_DELAYS_MS = {
+        1_000L, 2_000L, 4_000L, 8_000L, 15_000L
+    };
 
     private final Object lifecycleLock = new Object();
     private final ClientIdentityStore identityStore;
@@ -47,6 +50,7 @@ public final class ChatClientController implements AutoCloseable {
     private final ExecutorService backgroundExecutor;
     private final ScheduledExecutorService scheduler;
     private final long keepAliveIntervalSeconds;
+    private final long[] reconnectDelaysMs;
     private final ConcurrentMap<String, PublicKey> peerPublicKeys =
             new ConcurrentHashMap<>();
     private final ConcurrentMap<String, Boolean> presenceByUsername =
@@ -60,6 +64,10 @@ public final class ChatClientController implements AutoCloseable {
     private volatile PacketChannel channel;
     private volatile Identity identity;
     private volatile ScheduledFuture<?> keepAliveTask;
+    private volatile ScheduledFuture<?> reconnectTask;
+    private volatile String connectionHost;
+    private volatile int connectionPort;
+    private volatile int reconnectAttempt;
     private volatile boolean closed;
 
     public ChatClientController(ClientIdentityStore identityStore,
@@ -67,7 +75,8 @@ public final class ChatClientController implements AutoCloseable {
         this(identityStore, trustStore,
                 new ClientCryptoService(),
                 SocketPacketChannel::connect,
-                KEEP_ALIVE_INTERVAL_SECONDS);
+                KEEP_ALIVE_INTERVAL_SECONDS,
+                DEFAULT_RECONNECT_DELAYS_MS);
     }
 
     ChatClientController(ClientIdentityStore identityStore,
@@ -75,7 +84,7 @@ public final class ChatClientController implements AutoCloseable {
             ClientCryptoService cryptoService,
             ChannelConnector channelConnector) {
         this(identityStore, trustStore, cryptoService, channelConnector,
-                KEEP_ALIVE_INTERVAL_SECONDS);
+                KEEP_ALIVE_INTERVAL_SECONDS, DEFAULT_RECONNECT_DELAYS_MS);
     }
 
     ChatClientController(ClientIdentityStore identityStore,
@@ -83,6 +92,16 @@ public final class ChatClientController implements AutoCloseable {
             ClientCryptoService cryptoService,
             ChannelConnector channelConnector,
             long keepAliveIntervalSeconds) {
+        this(identityStore, trustStore, cryptoService, channelConnector,
+                keepAliveIntervalSeconds, DEFAULT_RECONNECT_DELAYS_MS);
+    }
+
+    ChatClientController(ClientIdentityStore identityStore,
+            LocalTrustStore trustStore,
+            ClientCryptoService cryptoService,
+            ChannelConnector channelConnector,
+            long keepAliveIntervalSeconds,
+            long[] reconnectDelaysMs) {
         this.identityStore = Objects.requireNonNull(
                 identityStore, "identityStore cannot be null");
         this.trustStore = Objects.requireNonNull(
@@ -96,6 +115,17 @@ public final class ChatClientController implements AutoCloseable {
                     "keepAliveIntervalSeconds phai lon hon 0");
         }
         this.keepAliveIntervalSeconds = keepAliveIntervalSeconds;
+        if (reconnectDelaysMs == null || reconnectDelaysMs.length == 0) {
+            throw new IllegalArgumentException(
+                    "reconnectDelaysMs khong duoc rong");
+        }
+        this.reconnectDelaysMs = reconnectDelaysMs.clone();
+        for (long delay : this.reconnectDelaysMs) {
+            if (delay < 1) {
+                throw new IllegalArgumentException(
+                        "Reconnect delay phai lon hon 0");
+            }
+        }
         this.backgroundExecutor = Executors.newFixedThreadPool(
                 2, new ClientThreadFactory());
         this.scheduler = Executors.newSingleThreadScheduledExecutor(
@@ -197,7 +227,7 @@ public final class ChatClientController implements AutoCloseable {
                 dispatchError("ENCRYPT_FAILED", e.getMessage());
             } catch (IOException e) {
                 if (currentChannel == channel) {
-                    connectionLost(e.getMessage());
+                    connectionLost(currentChannel, e.getMessage());
                 }
             }
         });
@@ -225,7 +255,7 @@ public final class ChatClientController implements AutoCloseable {
             try {
                 Identity newIdentity = identityStore.create(
                         username, passphraseCopy);
-                connectAndAuthenticate(host, port, newIdentity);
+                connectAndAuthenticate(host, port, newIdentity, false);
             } catch (IOException | GeneralSecurityException
                     | IllegalArgumentException e) {
                 authenticationFailed("REGISTER_FAILED", e.getMessage());
@@ -257,7 +287,7 @@ public final class ChatClientController implements AutoCloseable {
             try {
                 Identity loadedIdentity = identityStore.load(
                         username, passphraseCopy);
-                connectAndAuthenticate(host, port, loadedIdentity);
+                connectAndAuthenticate(host, port, loadedIdentity, false);
             } catch (IOException | GeneralSecurityException
                     | IllegalArgumentException e) {
                 authenticationFailed("LOGIN_FAILED", e.getMessage());
@@ -273,11 +303,15 @@ public final class ChatClientController implements AutoCloseable {
             current = channel;
             channel = null;
             identity = null;
+            connectionHost = null;
+            connectionPort = 0;
+            reconnectAttempt = 0;
             peerPublicKeys.clear();
             presenceByUsername.clear();
             pendingMessages.clear();
         }
         stopKeepAlive();
+        stopReconnect();
         closeQuietly(current);
         if (!closed) {
             setState(State.DISCONNECTED);
@@ -301,13 +335,15 @@ public final class ChatClientController implements AutoCloseable {
     }
 
     private void connectAndAuthenticate(String host, int port,
-            Identity candidateIdentity) {
+            Identity candidateIdentity, boolean reconnecting) {
         PacketChannel candidateChannel = null;
         try {
             validateEndpoint(host, port);
             candidateChannel = channelConnector.connect(
                     host.trim(), port, DEFAULT_CONNECT_TIMEOUT_MS);
-            setState(State.AUTHENTICATING);
+            if (!reconnecting) {
+                setState(State.AUTHENTICATING);
+            }
 
             Envelope challenge = candidateChannel.receive();
             if (challenge.getOp() != Opcode.AUTH_CHALLENGE) {
@@ -358,11 +394,20 @@ public final class ChatClientController implements AutoCloseable {
                 }
                 channel = candidateChannel;
                 identity = candidateIdentity;
+                connectionHost = host.trim();
+                connectionPort = port;
+                reconnectAttempt = 0;
             }
+            stopReconnect();
             setState(State.CONNECTED);
             startKeepAlive(candidateChannel, candidateIdentity);
-            dispatchUi(() -> listener.onAuthenticated(
-                    candidateIdentity.getUsername()));
+            if (reconnecting) {
+                dispatchUi(() -> listener.onReconnected(
+                        candidateIdentity.getUsername()));
+            } else {
+                dispatchUi(() -> listener.onAuthenticated(
+                        candidateIdentity.getUsername()));
+            }
             receiveLoop(candidateChannel);
         } catch (AuthenticationException e) {
             closeQuietly(candidateChannel);
@@ -370,7 +415,11 @@ public final class ChatClientController implements AutoCloseable {
         } catch (IOException | GeneralSecurityException
                 | IllegalArgumentException e) {
             closeQuietly(candidateChannel);
-            authenticationFailed("CONNECTION_FAILED", e.getMessage());
+            if (reconnecting && !closed) {
+                scheduleReconnect(e.getMessage());
+            } else {
+                authenticationFailed("CONNECTION_FAILED", e.getMessage());
+            }
         }
     }
 
@@ -383,7 +432,7 @@ public final class ChatClientController implements AutoCloseable {
             }
         } catch (IOException e) {
             if (!closed && activeChannel == channel) {
-                connectionLost(e.getMessage());
+                connectionLost(activeChannel, e.getMessage());
             }
         }
     }
@@ -554,7 +603,7 @@ public final class ChatClientController implements AutoCloseable {
                 current.send(envelope);
             } catch (IOException e) {
                 if (current == channel) {
-                    connectionLost(e.getMessage());
+                    connectionLost(current, e.getMessage());
                 }
             }
         });
@@ -586,7 +635,7 @@ public final class ChatClientController implements AutoCloseable {
                 activeChannel.send(ping);
             } catch (IOException e) {
                 if (channel == activeChannel && !closed) {
-                    connectionLost(e.getMessage());
+                    connectionLost(activeChannel, e.getMessage());
                 }
             }
         }, keepAliveIntervalSeconds, keepAliveIntervalSeconds,
@@ -601,15 +650,69 @@ public final class ChatClientController implements AutoCloseable {
         }
     }
 
-    private void connectionLost(String message) {
+    private void connectionLost(PacketChannel failedChannel, String message) {
         stopKeepAlive();
         synchronized (lifecycleLock) {
-            closeQuietly(channel);
+            if (closed || channel != failedChannel) {
+                return;
+            }
+            closeQuietly(failedChannel);
             channel = null;
         }
-        setState(State.DISCONNECTED);
+        markAllPeersOffline();
+        setState(State.RECONNECTING);
         dispatchUi(() -> listener.onConnectionLost(
                 safeMessage(message, "Mat ket noi Server")));
+        scheduleReconnect(message);
+    }
+
+    private void scheduleReconnect(String failureMessage) {
+        Identity reconnectIdentity;
+        String host;
+        int port;
+        int attempt;
+        long delayMs;
+        synchronized (lifecycleLock) {
+            if (closed || identity == null || connectionHost == null) {
+                return;
+            }
+            reconnectIdentity = identity;
+            host = connectionHost;
+            port = connectionPort;
+            attempt = reconnectAttempt + 1;
+            int delayIndex = Math.min(reconnectAttempt,
+                    reconnectDelaysMs.length - 1);
+            delayMs = reconnectDelaysMs[delayIndex];
+            reconnectAttempt++;
+        }
+
+        stopReconnect();
+        setState(State.RECONNECTING);
+        dispatchUi(() -> listener.onReconnectScheduled(
+                attempt, delayMs,
+                safeMessage(failureMessage, "Mat ket noi Server")));
+        reconnectTask = scheduler.schedule(() -> {
+            if (closed || state != State.RECONNECTING) {
+                return;
+            }
+            backgroundExecutor.execute(() -> connectAndAuthenticate(
+                    host, port, reconnectIdentity, true));
+        }, delayMs, TimeUnit.MILLISECONDS);
+    }
+
+    private void stopReconnect() {
+        ScheduledFuture<?> currentTask = reconnectTask;
+        reconnectTask = null;
+        if (currentTask != null) {
+            currentTask.cancel(false);
+        }
+    }
+
+    private void markAllPeersOffline() {
+        for (String username : presenceByUsername.keySet()) {
+            presenceByUsername.put(username, false);
+            dispatchUi(() -> listener.onPresenceChanged(username, false));
+        }
     }
 
     private void authenticationFailed(String code, String message) {
@@ -617,7 +720,11 @@ public final class ChatClientController implements AutoCloseable {
         synchronized (lifecycleLock) {
             channel = null;
             identity = null;
+            connectionHost = null;
+            connectionPort = 0;
+            reconnectAttempt = 0;
         }
+        stopReconnect();
         if (!closed) {
             setState(State.DISCONNECTED);
         }
@@ -694,6 +801,7 @@ public final class ChatClientController implements AutoCloseable {
             pendingMessages.clear();
         }
         stopKeepAlive();
+        stopReconnect();
         state = State.CLOSED;
         backgroundExecutor.shutdownNow();
         scheduler.shutdownNow();
@@ -717,6 +825,13 @@ public final class ChatClientController implements AutoCloseable {
         }
 
         default void onConnectionLost(String message) {
+        }
+
+        default void onReconnectScheduled(int attempt, long delayMs,
+                String message) {
+        }
+
+        default void onReconnected(String username) {
         }
 
         default void onError(String code, String message) {

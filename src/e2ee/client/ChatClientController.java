@@ -445,6 +445,9 @@ public final class ChatClientController implements AutoCloseable {
             while (!closed && activeChannel == channel
                     && activeChannel.isOpen()) {
                 Envelope envelope = activeChannel.receive();
+                if (closed || activeChannel != channel) {
+                    break;
+                }
                 handleEnvelope(envelope);
             }
         } catch (IOException e) {

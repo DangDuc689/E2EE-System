@@ -13,8 +13,14 @@ import e2ee.common.net.SocketPacketChannel;
 import javax.swing.SwingUtilities;
 import java.io.IOException;
 import java.security.GeneralSecurityException;
+import java.security.PublicKey;
 import java.util.Base64;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
@@ -33,6 +39,10 @@ public final class ChatClientController implements AutoCloseable {
     private final ClientCryptoService cryptoService;
     private final ChannelConnector channelConnector;
     private final ExecutorService backgroundExecutor;
+    private final ConcurrentMap<String, PublicKey> peerPublicKeys =
+            new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, Boolean> presenceByUsername =
+            new ConcurrentHashMap<>();
 
     private volatile Listener listener = new Listener() {
     };
@@ -80,6 +90,35 @@ public final class ChatClientController implements AutoCloseable {
 
     public LocalTrustStore getTrustStore() {
         return trustStore;
+    }
+
+    public Map<String, Boolean> getPresenceSnapshot() {
+        return Collections.unmodifiableMap(
+                new HashMap<>(presenceByUsername));
+    }
+
+    public boolean isPeerOnline(String username) {
+        return Boolean.TRUE.equals(presenceByUsername.get(username));
+    }
+
+    /**
+     * Yêu cầu Server trả public key của một người dùng.
+     */
+    public void lookupPeer(String username) {
+        if (!isValidUsername(username)) {
+            dispatchError("INVALID_USERNAME", "Username ban chat khong hop le");
+            return;
+        }
+
+        Identity currentIdentity = identity;
+        if (state != State.CONNECTED || currentIdentity == null) {
+            dispatchError("NOT_CONNECTED", "Client chua ket noi");
+            return;
+        }
+
+        Envelope lookup = Envelope.create(
+                Opcode.KEY_LOOKUP, currentIdentity.getUsername(), username);
+        sendAsync(lookup);
     }
 
     /**
@@ -152,6 +191,8 @@ public final class ChatClientController implements AutoCloseable {
             current = channel;
             channel = null;
             identity = null;
+            peerPublicKeys.clear();
+            presenceByUsername.clear();
         }
         closeQuietly(current);
         if (!closed) {
@@ -268,9 +309,88 @@ public final class ChatClientController implements AutoCloseable {
             return;
         }
 
-        if (envelope.getOp() == Opcode.ERROR) {
-            dispatchError(envelope.getString("code"),
+        switch (envelope.getOp()) {
+            case ERROR -> dispatchError(envelope.getString("code"),
                     envelope.getString("msg"));
+            case KEY_LOOKUP_RESULT -> handleKeyLookupResult(envelope);
+            case PRESENCE -> handlePresence(envelope);
+            default -> {
+                // Các opcode chat, keep-alive và offline được xử lý ở lát cắt sau.
+            }
+        }
+    }
+
+    private void handleKeyLookupResult(Envelope envelope) {
+        String username = envelope.getFrom();
+        String publicKeyBase64 = envelope.getString("pubkey");
+        if (!isValidUsername(username)
+                || publicKeyBase64 == null
+                || publicKeyBase64.isBlank()) {
+            dispatchError("INVALID_KEY_RESULT",
+                    "KEY_LOOKUP_RESULT khong hop le");
+            return;
+        }
+
+        try {
+            boolean trusted = trustStore.checkPeerKey(
+                    username, publicKeyBase64);
+            if (!trusted) {
+                dispatchUi(() -> listener.onPeerKeyMismatch(
+                        username, publicKeyBase64));
+                return;
+            }
+
+            PublicKey publicKey = decodePublicKey(publicKeyBase64);
+            peerPublicKeys.put(username, publicKey);
+            String fingerprint = trustStore.getFingerprint(username);
+            boolean verified = trustStore.isVerified(username);
+            dispatchUi(() -> listener.onPeerKeyAvailable(
+                    username, fingerprint, verified));
+        } catch (IOException | GeneralSecurityException
+                | IllegalArgumentException e) {
+            dispatchError("INVALID_PUBLIC_KEY", e.getMessage());
+        }
+    }
+
+    private void handlePresence(Envelope envelope) {
+        Object onlineValue = envelope.get("online");
+        String username = envelope.getString("user");
+        if (!isValidUsername(username)
+                || !(onlineValue instanceof Boolean online)) {
+            dispatchError("INVALID_PRESENCE", "PRESENCE khong hop le");
+            return;
+        }
+
+        presenceByUsername.put(username, online);
+        dispatchUi(() -> listener.onPresenceChanged(username, online));
+    }
+
+    private void sendAsync(Envelope envelope) {
+        backgroundExecutor.execute(() -> {
+            PacketChannel current = channel;
+            if (closed || state != State.CONNECTED
+                    || current == null || !current.isOpen()) {
+                dispatchError("NOT_CONNECTED", "Client chua ket noi");
+                return;
+            }
+            try {
+                current.send(envelope);
+            } catch (IOException e) {
+                if (current == channel) {
+                    connectionLost(e.getMessage());
+                }
+            }
+        });
+    }
+
+    private static PublicKey decodePublicKey(String publicKeyBase64)
+            throws GeneralSecurityException {
+        try {
+            return ClientCryptoEngine.decodeRsaPublicKey(
+                    Base64.getDecoder().decode(publicKeyBase64));
+        } catch (IllegalArgumentException e) {
+            throw new GeneralSecurityException(
+                    "Public key Base64 khong hop le", e);
         }
     }
 
@@ -331,6 +451,12 @@ public final class ChatClientController implements AutoCloseable {
         }
     }
 
+    private static boolean isValidUsername(String username) {
+        return username != null
+                && !"server".equals(username)
+                && username.matches("^[a-z0-9_]{3,20}$");
+    }
+
     private static String safeMessage(String value, String fallback) {
         return value == null || value.isBlank() ? fallback : value;
     }
@@ -354,6 +480,8 @@ public final class ChatClientController implements AutoCloseable {
             closeQuietly(channel);
             channel = null;
             identity = null;
+            peerPublicKeys.clear();
+            presenceByUsername.clear();
         }
         state = State.CLOSED;
         backgroundExecutor.shutdownNow();
@@ -380,6 +508,17 @@ public final class ChatClientController implements AutoCloseable {
         }
 
         default void onError(String code, String message) {
+        }
+
+        default void onPeerKeyAvailable(String username,
+                String fingerprint, boolean verified) {
+        }
+
+        default void onPeerKeyMismatch(String username,
+                String newPublicKeyBase64) {
+        }
+
+        default void onPresenceChanged(String username, boolean online) {
         }
     }
 

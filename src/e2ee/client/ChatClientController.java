@@ -681,6 +681,11 @@ public final class ChatClientController implements AutoCloseable {
                     "Tin nhan goc trong OFFLINE_SYNC khong hop le");
             return;
         }
+        if (cryptoService.isMessageSeen(original.getId())) {
+            sendAsync(OfflineSyncService.createAckEnvelope(
+                    currentIdentity.getUsername(), original.getId()));
+            return;
+        }
 
         PublicKey senderKey = findPeerKey(senderUsername);
         if (senderKey == null) {
@@ -733,14 +738,16 @@ public final class ChatClientController implements AutoCloseable {
                                 currentIdentity.getPrivateKey());
                 Envelope original = result.getOriginalEnvelope();
                 dispatchUi(() -> {
-                    if (currentIdentity != identity
-                            || state != State.CONNECTED) {
+                    if (closed) {
                         return;
                     }
                     listener.onMessageReceived(
                             original.getFrom(), result.getDecryptedContent(),
                             original.getId(), original.getTs());
-                    sendAsync(result.getAckEnvelope());
+                    if (currentIdentity == identity
+                            && state == State.CONNECTED) {
+                        sendAsync(result.getAckEnvelope());
+                    }
                 });
             } catch (GeneralSecurityException
                     | e2ee.common.json.JsonParseException

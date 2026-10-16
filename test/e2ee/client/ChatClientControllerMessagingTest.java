@@ -5,6 +5,7 @@ import e2ee.client.crypto.ClientCryptoService;
 import e2ee.client.identity.ClientIdentityStore;
 import e2ee.client.security.LocalTrustStore;
 import e2ee.common.TestSupport;
+import e2ee.common.codec.EnvelopeMapper;
 import e2ee.common.contract.Envelope;
 import e2ee.common.contract.Opcode;
 import e2ee.common.contract.PacketChannel;
@@ -20,6 +21,7 @@ import java.util.Base64;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
@@ -40,6 +42,8 @@ public final class ChatClientControllerMessagingTest {
                 ChatClientControllerMessagingTest::testPendingKeyLookup);
         TestSupport.check("CCC-M4 - Tin bi sua chi tao canh bao bao mat",
                 ChatClientControllerMessagingTest::testTamperedMessage);
+        TestSupport.check("CCC-M5 - Tin offline lap lai van gui ACK",
+                ChatClientControllerMessagingTest::testOfflineRetryAck);
 
         TestSupport.summary();
     }
@@ -150,6 +154,49 @@ public final class ChatClientControllerMessagingTest {
         }
     }
 
+    private static void testOfflineRetryAck() throws Exception {
+        TestContext context = TestContext.create();
+        KeyPair bob = ClientCryptoEngine.generateRsaKeyPair();
+        context.trustStore.checkPeerKey("bob", encodePublicKey(bob));
+        Session session = context.openSession();
+        try {
+            Envelope original = new ClientCryptoService()
+                    .createEncrypted1to1Message(
+                            "bob", "alice", "Tin offline chi hien thi mot lan",
+                            session.server.alicePublicKey.get(),
+                            bob.getPrivate());
+            Envelope sync = Envelope.create(
+                    Opcode.OFFLINE_SYNC, "server", "alice")
+                    .put("original_envelope",
+                            EnvelopeMapper.toMap(original));
+
+            session.server.serverChannel.send(sync);
+            session.listener.awaitReceived();
+            Envelope firstAck = session.server.serverChannel.receive();
+            assertDeliveredAck(firstAck, original.getId());
+
+            session.server.serverChannel.send(sync);
+            Envelope retryAck = session.server.serverChannel.receive();
+            assertDeliveredAck(retryAck, original.getId());
+            Thread.sleep(300L);
+            TestSupport.assertEquals(1,
+                    session.listener.receivedCount.get());
+        } finally {
+            session.close();
+            context.delete();
+        }
+    }
+
+    private static void assertDeliveredAck(Envelope ack,
+            String expectedMessageId) {
+        TestSupport.assertEquals(Opcode.ACK, ack.getOp());
+        TestSupport.assertEquals("alice", ack.getFrom());
+        TestSupport.assertEquals("server", ack.getTo());
+        TestSupport.assertEquals(expectedMessageId,
+                ack.getString("ack_msg_id"));
+        TestSupport.assertEquals("DELIVERED", ack.getString("status"));
+    }
+
     private static String encodePublicKey(KeyPair keyPair) {
         return Base64.getEncoder().encodeToString(
                 keyPair.getPublic().getEncoded());
@@ -164,6 +211,7 @@ public final class ChatClientControllerMessagingTest {
         private final AtomicReference<String> receivedFrom = new AtomicReference<>();
         private final AtomicReference<String> receivedContent = new AtomicReference<>();
         private final AtomicBoolean receivedOnEdt = new AtomicBoolean();
+        private final AtomicInteger receivedCount = new AtomicInteger();
 
         @Override
         public void onAuthenticated(String username) {
@@ -182,6 +230,7 @@ public final class ChatClientControllerMessagingTest {
             receivedFrom.set(senderUsername);
             receivedContent.set(content);
             receivedOnEdt.set(SwingUtilities.isEventDispatchThread());
+            receivedCount.incrementAndGet();
             received.countDown();
         }
 

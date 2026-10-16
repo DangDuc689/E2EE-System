@@ -35,6 +35,10 @@ import java.util.Objects;
 public final class ChatFrame extends JFrame {
     private static final Color PRIMARY = new Color(37, 99, 235);
     private static final Color BACKGROUND = new Color(248, 250, 252);
+    private static final Color SECURITY_WARNING_BACKGROUND =
+            new Color(254, 226, 226);
+    private static final Color SECURITY_WARNING_FOREGROUND =
+            new Color(153, 27, 27);
 
     private final String myUsername;
     private final Actions actions;
@@ -44,6 +48,8 @@ public final class ChatFrame extends JFrame {
     private final JTextField addFriendField = new JTextField();
     private final JPanel messagesPanel = new JPanel();
     private final JScrollPane messagesScroll;
+    private final JPanel conversationPanel = new JPanel(new BorderLayout());
+    private final JPanel composerPanel = new JPanel(new BorderLayout(8, 8));
     private final JTextArea messageInput = new JTextArea(2, 24);
     private final JButton sendButton = new JButton("Gửi");
     private final JButton securityButton = new JButton("🔒 Đối soát");
@@ -56,6 +62,7 @@ public final class ChatFrame extends JFrame {
     private final Map<String, List<ChatMessage>> conversations =
             new HashMap<>();
     private final Map<String, Boolean> sendAllowed = new HashMap<>();
+    private final Map<String, Boolean> securityWarnings = new HashMap<>();
 
     private String selectedPeer;
 
@@ -123,7 +130,6 @@ public final class ChatFrame extends JFrame {
     }
 
     private JPanel createConversationPanel() {
-        JPanel conversation = new JPanel(new BorderLayout());
         conversationTitle.setFont(
                 conversationTitle.getFont().deriveFont(Font.BOLD, 17f));
         conversationTitle.setBorder(
@@ -136,15 +142,15 @@ public final class ChatFrame extends JFrame {
         messagesScroll.setBorder(BorderFactory.createEmptyBorder());
         messagesScroll.getVerticalScrollBar().setUnitIncrement(16);
 
-        conversation.add(conversationTitle, BorderLayout.NORTH);
-        conversation.add(messagesScroll, BorderLayout.CENTER);
-        conversation.add(createComposer(), BorderLayout.SOUTH);
-        return conversation;
+        conversationPanel.add(conversationTitle, BorderLayout.NORTH);
+        conversationPanel.add(messagesScroll, BorderLayout.CENTER);
+        conversationPanel.add(createComposer(), BorderLayout.SOUTH);
+        return conversationPanel;
     }
 
     private JPanel createComposer() {
-        JPanel composer = new JPanel(new BorderLayout(8, 8));
-        composer.setBorder(BorderFactory.createEmptyBorder(10, 12, 12, 12));
+        composerPanel.setBorder(
+                BorderFactory.createEmptyBorder(10, 12, 12, 12));
         messageInput.setLineWrap(true);
         messageInput.setWrapStyleWord(true);
         messageInput.setEnabled(false);
@@ -157,9 +163,9 @@ public final class ChatFrame extends JFrame {
         buttons.add(securityButton);
         buttons.add(sendButton);
 
-        composer.add(new JScrollPane(messageInput), BorderLayout.CENTER);
-        composer.add(buttons, BorderLayout.EAST);
-        return composer;
+        composerPanel.add(new JScrollPane(messageInput), BorderLayout.CENTER);
+        composerPanel.add(buttons, BorderLayout.EAST);
+        return composerPanel;
     }
 
     private void bindActions() {
@@ -259,6 +265,21 @@ public final class ChatFrame extends JFrame {
         updateComposerState();
     }
 
+    /**
+     * Hiển thị trạng thái nguy hiểm cho đúng cuộc trò chuyện có khóa thay đổi.
+     */
+    public void setPeerSecurityWarning(String username, boolean warning) {
+        requireEdt();
+        securityWarnings.put(username, warning);
+        if (warning) {
+            sendAllowed.put(username, false);
+        }
+        if (Objects.equals(selectedPeer, username)) {
+            updateSecurityAppearance();
+            updateComposerState();
+        }
+    }
+
     public void showBanner(String message, BannerType type) {
         requireEdt();
         connectionBanner.setText(message);
@@ -293,6 +314,7 @@ public final class ChatFrame extends JFrame {
             }
         }
         updateComposerState();
+        updateSecurityAppearance();
         messagesPanel.revalidate();
         messagesPanel.repaint();
         SwingUtilities.invokeLater(() -> messagesScroll
@@ -309,6 +331,23 @@ public final class ChatFrame extends JFrame {
         securityButton.setEnabled(hasPeer);
     }
 
+    private void updateSecurityAppearance() {
+        boolean warning = selectedPeer != null
+                && securityWarnings.getOrDefault(selectedPeer, false);
+        Color background = warning
+                ? SECURITY_WARNING_BACKGROUND : BACKGROUND;
+        messagesPanel.setBackground(background);
+        composerPanel.setBackground(background);
+        conversationTitle.setOpaque(warning);
+        conversationTitle.setBackground(background);
+        conversationTitle.setForeground(warning
+                ? SECURITY_WARNING_FOREGROUND : Color.BLACK);
+        conversationPanel.setBorder(warning
+                ? BorderFactory.createLineBorder(
+                        SECURITY_WARNING_FOREGROUND, 3)
+                : BorderFactory.createEmptyBorder());
+    }
+
     int getFriendCount() {
         return friendModel.size();
     }
@@ -319,6 +358,13 @@ public final class ChatFrame extends JFrame {
 
     boolean isSendEnabled() {
         return sendButton.isEnabled();
+    }
+
+    boolean isSecurityWarningVisible() {
+        return selectedPeer != null
+                && securityWarnings.getOrDefault(selectedPeer, false)
+                && SECURITY_WARNING_BACKGROUND.equals(
+                        messagesPanel.getBackground());
     }
 
     private static void requireEdt() {

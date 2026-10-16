@@ -55,6 +55,15 @@ public final class ChatFrameTest {
             frame.setPeerSendAllowed("bob", false);
             TestSupport.assertTrue(!frame.isSendEnabled(),
                     "Nut gui phai khoa khi peer khong an toan");
+            frame.setPeerSecurityWarning("bob", true);
+            TestSupport.assertTrue(frame.isSecurityWarningVisible(),
+                    "Khung chat phai doi mau khi khoa peer thay doi");
+            frame.setPeerSecurityWarning("bob", false);
+            frame.setPeerSendAllowed("bob", true);
+            TestSupport.assertTrue(!frame.isSecurityWarningVisible(),
+                    "Canh bao phai duoc go sau khi doi soat");
+            TestSupport.assertTrue(frame.isSendEnabled(),
+                    "Nut gui phai mo lai sau khi doi soat");
             TestSupport.assertTrue(frame.getMinimumSize().width >= 800,
                     "ChatFrame phai co layout co gian hop ly");
             frame.dispose();

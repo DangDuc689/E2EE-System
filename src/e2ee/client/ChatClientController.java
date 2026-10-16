@@ -62,6 +62,10 @@ public final class ChatClientController implements AutoCloseable {
             new ConcurrentHashMap<>();
     private final ConcurrentMap<String, ArrayList<Envelope>> pendingOfflineMessages =
             new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, String> pendingChangedKeys =
+            new ConcurrentHashMap<>();
+    private final java.util.Set<String> blockedPeers =
+            ConcurrentHashMap.newKeySet();
 
     private volatile Listener listener = new Listener() {
     };
@@ -201,6 +205,11 @@ public final class ChatClientController implements AutoCloseable {
             dispatchError("EMPTY_MESSAGE", "Tin nhan khong duoc de trong");
             return;
         }
+        if (blockedPeers.contains(recipientUsername)) {
+            dispatchError("PEER_KEY_CHANGED",
+                    "Khoa bao mat cua ban chat da thay doi");
+            return;
+        }
 
         Identity currentIdentity = identity;
         PacketChannel currentChannel = channel;
@@ -240,6 +249,99 @@ public final class ChatClientController implements AutoCloseable {
                 }
             }
         });
+    }
+
+    /**
+     * Tính fingerprint trên luồng nền để mở hộp thoại đối soát.
+     */
+    public void requestFingerprintDetails(String username) {
+        if (!isValidUsername(username)) {
+            dispatchError("INVALID_USERNAME", "Username ban chat khong hop le");
+            return;
+        }
+        Identity currentIdentity = identity;
+        if (currentIdentity == null) {
+            dispatchError("NOT_CONNECTED", "Client chua dang nhap");
+            return;
+        }
+
+        backgroundExecutor.execute(() -> {
+            try {
+                String peerKeyBase64 = pendingChangedKeys.get(username);
+                boolean keyChanged = peerKeyBase64 != null;
+                if (peerKeyBase64 == null) {
+                    peerKeyBase64 = trustStore.getPublicKeyBase64(username);
+                }
+                if (peerKeyBase64 == null) {
+                    dispatchError("PEER_KEY_UNAVAILABLE",
+                            "Chua co public key cua ban chat");
+                    return;
+                }
+
+                String myFingerprint = ClientCryptoService
+                        .calculateFingerprint(currentIdentity.getPublicKey());
+                String peerFingerprint = ClientCryptoService
+                        .calculateFingerprint(decodePublicKey(peerKeyBase64));
+                dispatchUi(() -> listener.onFingerprintDetails(
+                        username, myFingerprint, peerFingerprint,
+                        keyChanged));
+            } catch (GeneralSecurityException e) {
+                dispatchError("FINGERPRINT_FAILED", e.getMessage());
+            }
+        });
+    }
+
+    /**
+     * Chấp nhận khóa đang cảnh báo sau khi người dùng đối soát qua kênh ngoài.
+     */
+    public void acceptPeerKey(String username, String expectedFingerprint) {
+        if (!isValidUsername(username)) {
+            dispatchError("INVALID_USERNAME", "Username ban chat khong hop le");
+            return;
+        }
+        if (expectedFingerprint == null || expectedFingerprint.isBlank()) {
+            dispatchError("INVALID_FINGERPRINT",
+                    "Fingerprint doi soat khong hop le");
+            return;
+        }
+        backgroundExecutor.execute(() -> {
+            try {
+                String changedKey = pendingChangedKeys.get(username);
+                String candidateKey = changedKey != null
+                        ? changedKey
+                        : trustStore.getPublicKeyBase64(username);
+                if (candidateKey == null) {
+                    dispatchError("PEER_KEY_UNAVAILABLE",
+                            "Chua co public key cua ban chat");
+                    return;
+                }
+                String currentFingerprint = ClientCryptoService
+                        .calculateFingerprint(decodePublicKey(candidateKey));
+                if (!currentFingerprint.equals(expectedFingerprint)) {
+                    dispatchError("TRUST_CANDIDATE_CHANGED",
+                            "Khoa da thay doi trong luc doi soat; hay kiem tra lai");
+                    return;
+                }
+                if (changedKey != null) {
+                    trustStore.acceptNewKey(username, changedKey);
+                }
+                trustStore.markVerified(username);
+                String trustedKey = trustStore.getPublicKeyBase64(username);
+                peerPublicKeys.put(username, decodePublicKey(trustedKey));
+                pendingChangedKeys.remove(username);
+                blockedPeers.remove(username);
+                String fingerprint = trustStore.getFingerprint(username);
+                dispatchUi(() -> listener.onPeerTrustRestored(
+                        username, fingerprint));
+            } catch (IOException | GeneralSecurityException
+                    | IllegalArgumentException e) {
+                dispatchError("TRUST_UPDATE_FAILED", e.getMessage());
+            }
+        });
+    }
+
+    public boolean isPeerBlocked(String username) {
+        return blockedPeers.contains(username);
     }
 
     /**
@@ -329,6 +431,8 @@ public final class ChatClientController implements AutoCloseable {
             presenceByUsername.clear();
             pendingMessages.clear();
             pendingOfflineMessages.clear();
+            pendingChangedKeys.clear();
+            blockedPeers.clear();
         }
         stopKeepAlive();
         stopReconnect();
@@ -531,6 +635,7 @@ public final class ChatClientController implements AutoCloseable {
             case PRESENCE -> handlePresence(envelope);
             case CHAT_1TO1 -> handleIncomingChat(envelope);
             case OFFLINE_SYNC -> handleOfflineSync(envelope);
+            case KEY_CHANGED -> handleKeyChanged(envelope);
             case PONG -> {
                 if (!"server".equals(envelope.getFrom())) {
                     dispatchError("INVALID_PONG", "PONG khong hop le");
@@ -569,8 +674,7 @@ public final class ChatClientController implements AutoCloseable {
             boolean trusted = trustStore.checkPeerKey(
                     username, publicKeyBase64);
             if (!trusted) {
-                dispatchUi(() -> listener.onPeerKeyMismatch(
-                        username, publicKeyBase64));
+                blockChangedPeerKey(username, publicKeyBase64);
                 return;
             }
 
@@ -588,6 +692,50 @@ public final class ChatClientController implements AutoCloseable {
         }
     }
 
+    private void handleKeyChanged(Envelope envelope) {
+        String username = envelope.getFrom();
+        String newPublicKey = envelope.getString("new_pubkey");
+        if (!isValidUsername(username)
+                || newPublicKey == null || newPublicKey.isBlank()) {
+            dispatchError("INVALID_KEY_CHANGED", "KEY_CHANGED khong hop le");
+            return;
+        }
+
+        try {
+            boolean trusted = trustStore.checkPeerKey(username, newPublicKey);
+            if (!trusted) {
+                blockChangedPeerKey(username, newPublicKey);
+                return;
+            }
+            PublicKey publicKey = decodePublicKey(newPublicKey);
+            peerPublicKeys.put(username, publicKey);
+            String fingerprint = trustStore.getFingerprint(username);
+            dispatchUi(() -> listener.onPeerKeyAvailable(
+                    username, fingerprint,
+                    trustStore.isVerified(username)));
+        } catch (IOException | GeneralSecurityException
+                | IllegalArgumentException e) {
+            dispatchError("INVALID_PUBLIC_KEY", e.getMessage());
+        }
+    }
+
+    private void blockChangedPeerKey(String username,
+            String newPublicKeyBase64) {
+        try {
+            // Giải mã trước để không lưu ứng viên Base64/RSA giả mạo.
+            decodePublicKey(newPublicKeyBase64);
+            pendingChangedKeys.put(username, newPublicKeyBase64);
+            blockedPeers.add(username);
+            peerPublicKeys.remove(username);
+            pendingMessages.remove(username);
+            pendingOfflineMessages.remove(username);
+            dispatchUi(() -> listener.onPeerKeyMismatch(
+                    username, newPublicKeyBase64));
+        } catch (GeneralSecurityException e) {
+            dispatchError("INVALID_PUBLIC_KEY", e.getMessage());
+        }
+    }
+
     private void handleIncomingChat(Envelope envelope) {
         Identity currentIdentity = identity;
         String senderUsername = envelope.getFrom();
@@ -595,6 +743,11 @@ public final class ChatClientController implements AutoCloseable {
                 || !isValidUsername(senderUsername)
                 || !currentIdentity.getUsername().equals(envelope.getTo())) {
             dispatchError("INVALID_CHAT", "CHAT_1TO1 khong hop le");
+            return;
+        }
+        if (blockedPeers.contains(senderUsername)) {
+            dispatchUi(() -> listener.onSecurityWarning(senderUsername,
+                    "Da chan tin nhan vi public key dang bi thay doi"));
             return;
         }
 
@@ -684,6 +837,11 @@ public final class ChatClientController implements AutoCloseable {
         if (cryptoService.isMessageSeen(original.getId())) {
             sendAsync(OfflineSyncService.createAckEnvelope(
                     currentIdentity.getUsername(), original.getId()));
+            return;
+        }
+        if (blockedPeers.contains(senderUsername)) {
+            dispatchUi(() -> listener.onSecurityWarning(senderUsername,
+                    "Da chan tin offline vi public key dang bi thay doi"));
             return;
         }
 
@@ -1016,6 +1174,8 @@ public final class ChatClientController implements AutoCloseable {
             presenceByUsername.clear();
             pendingMessages.clear();
             pendingOfflineMessages.clear();
+            pendingChangedKeys.clear();
+            blockedPeers.clear();
         }
         stopKeepAlive();
         stopReconnect();
@@ -1074,6 +1234,15 @@ public final class ChatClientController implements AutoCloseable {
         }
 
         default void onSecurityWarning(String username, String message) {
+        }
+
+        default void onFingerprintDetails(String username,
+                String myFingerprint, String peerFingerprint,
+                boolean keyChanged) {
+        }
+
+        default void onPeerTrustRestored(String username,
+                String fingerprint) {
         }
     }
 

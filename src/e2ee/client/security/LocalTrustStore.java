@@ -13,6 +13,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.security.GeneralSecurityException;
 import java.security.PublicKey;
+import java.security.interfaces.RSAKey;
 import java.util.Base64;
 import java.util.Collections;
 import java.util.LinkedHashMap;
@@ -245,6 +246,12 @@ public final class LocalTrustStore {
         try {
             byte[] encoded = Base64.getDecoder().decode(publicKeyBase64);
             PublicKey publicKey = ClientCryptoEngine.decodeRsaPublicKey(encoded);
+            if (!(publicKey instanceof RSAKey rsaKey)
+                    || rsaKey.getModulus().bitLength()
+                    != ClientCryptoEngine.RSA_KEY_SIZE_BITS) {
+                throw new GeneralSecurityException(
+                        "Public key phai la RSA-2048");
+            }
             String canonicalBase64 = Base64.getEncoder()
                     .encodeToString(publicKey.getEncoded());
             String fingerprint = ClientCryptoService

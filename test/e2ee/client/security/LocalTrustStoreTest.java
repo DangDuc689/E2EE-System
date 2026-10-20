@@ -8,6 +8,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.KeyPair;
+import java.security.KeyPairGenerator;
 import java.util.Base64;
 
 /**
@@ -31,6 +32,8 @@ public final class LocalTrustStoreTest {
                 LocalTrustStoreTest::testInvalidInput);
         TestSupport.check("LTS6 - Tu choi file JSON bi hong",
                 LocalTrustStoreTest::testCorruptedFile);
+        TestSupport.check("LTS7 - Tu choi khoa RSA khong dung 2048 bit",
+                LocalTrustStoreTest::testInvalidRsaKeySize);
 
         TestSupport.summary();
     }
@@ -157,6 +160,22 @@ public final class LocalTrustStoreTest {
                     StandardCharsets.UTF_8);
             TestSupport.assertThrows(java.io.IOException.class,
                     () -> new LocalTrustStore(files.storeFile));
+        } finally {
+            files.delete();
+        }
+    }
+
+    private static void testInvalidRsaKeySize() throws Exception {
+        TestStoreFiles files = TestStoreFiles.create();
+        try {
+            KeyPairGenerator generator = KeyPairGenerator.getInstance("RSA");
+            generator.initialize(1024);
+            String weakKey = encodePublicKey(generator.generateKeyPair());
+            LocalTrustStore store = new LocalTrustStore(files.storeFile);
+
+            TestSupport.assertThrows(
+                    java.security.GeneralSecurityException.class,
+                    () -> store.checkPeerKey("alice", weakKey));
         } finally {
             files.delete();
         }

@@ -34,6 +34,18 @@ public final class OfflineQueueRouter implements MessageRouter {
     private final OfflineMessageQueue offlineQueue;
     private final MessageRouter nextRouter;
     private final RoutedEnvelopeSender routedEnvelopeSender;
+    private volatile ServerEventListener eventListener;
+
+    public void setEventListener(ServerEventListener listener) {
+        this.eventListener = listener;
+    }
+
+    private void notifyEvent(String level, String event, String username, String details) {
+        ServerEventListener listener = this.eventListener;
+        if (listener != null) {
+            listener.onEvent(new ServerLogEntry(System.currentTimeMillis(), level, event, username, details));
+        }
+    }
 
     public OfflineQueueRouter(
             ConcurrentMap<String, ClientHandler> onlineUsers,
@@ -77,11 +89,17 @@ public final class OfflineQueueRouter implements MessageRouter {
         }
 
         ForwardResult result = sendToCurrentRecipient(recipientUsername, env);
-        if (result != ForwardResult.SENT) {
+        if (result == ForwardResult.SENT) {
+            notifyEvent("INFO", "MSG_RELAY", env.getFrom(),
+                    "Chuyển tiếp gói tin mã hóa AES-GCM đến " + recipientUsername);
+        } else {
             // Người nhận đang offline: Lưu nguyên vẹn Envelope bản mã vào hàng đợi
             offlineQueue.enqueue(recipientUsername, env);
+            int currentSize = offlineQueue.getQueueSize(recipientUsername);
             System.out.println("[E2EE-SERVER] [Issue 12] Nguoi nhan '" + recipientUsername
                     + "' offline. Da dua Envelope id=" + env.getId() + " vao OfflineMessageQueue.");
+            notifyEvent("INFO", "MSG_OFFLINE", recipientUsername,
+                    "Lưu tạm tin nhắn từ '" + env.getFrom() + "' vào hàng đợi (" + currentSize + "/" + OfflineMessageQueue.MAX_QUEUE_PER_USER + ")");
         }
     }
 
@@ -98,6 +116,8 @@ public final class OfflineQueueRouter implements MessageRouter {
             if (removed) {
                 System.out.println("[E2EE-SERVER] [Issue 12] Da nhan ACK tu '" + senderUsername
                         + "' cho message id=" + ackMsgId + " -> Da giai phong khoi queue.");
+                notifyEvent("INFO", "MSG_ACK", senderUsername,
+                        "Xác nhận ACK tin nhắn " + ackMsgId + ", giải phóng khỏi hàng đợi");
             }
         }
     }

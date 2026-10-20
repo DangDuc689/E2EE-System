@@ -8,6 +8,7 @@ import e2ee.client.identity.ClientIdentityStore;
 import e2ee.client.identity.ClientIdentityStore.Identity;
 import e2ee.client.security.LocalTrustStore;
 import e2ee.common.contract.Envelope;
+import e2ee.common.contract.MessageLimits;
 import e2ee.common.contract.Opcode;
 import e2ee.common.contract.PacketChannel;
 import e2ee.common.net.SocketPacketChannel;
@@ -214,6 +215,12 @@ public final class ChatClientController implements AutoCloseable {
             dispatchError("EMPTY_MESSAGE", "Tin nhan khong duoc de trong");
             return;
         }
+        if (!MessageLimits.isWithinLimit(content)) {
+            dispatchError("MESSAGE_TOO_LARGE",
+                    "Tin nhan qua dai (gioi han "
+                    + MessageLimits.MAX_TEXT_UTF8_BYTES + " byte UTF-8)");
+            return;
+        }
         if (ttlSeconds < 0 || ttlSeconds > 86_400) {
             dispatchError("INVALID_TTL", "TTL khong hop le");
             return;
@@ -245,7 +252,7 @@ public final class ChatClientController implements AutoCloseable {
                 Envelope encrypted = cryptoService.createEncrypted1to1Message(
                         currentIdentity.getUsername(), recipientUsername,
                         content, recipientKey,
-                        currentIdentity.getPrivateKey());
+                        currentIdentity.getPrivateKey(), ttlSeconds);
                 if (currentChannel != channel || !currentChannel.isOpen()) {
                     dispatchError("NOT_CONNECTED", "Client da mat ket noi");
                     return;
@@ -804,12 +811,25 @@ public final class ChatClientController implements AutoCloseable {
             PublicKey senderKey, Identity currentIdentity) {
         backgroundExecutor.execute(() -> {
             try {
-                String content = cryptoService.verifyAndDecrypt1to1Message(
-                        envelope, senderKey,
-                        currentIdentity.getPrivateKey(), false);
+                ClientCryptoService.Decrypted1to1Message decrypted =
+                        cryptoService.verifyAndDecrypt1to1(
+                                envelope, senderKey,
+                                currentIdentity.getPrivateKey(), false);
+                String content = decrypted.getContent();
+                if (!MessageLimits.isWithinLimit(content)) {
+                    dispatchUi(() -> listener.onSecurityWarning(
+                            envelope.getFrom(),
+                            "Tin nhan vuot qua gioi han kich thuoc cho phep"));
+                    return;
+                }
+                long expiresAt = decrypted.getExpiresAt();
+                if (expiresAt > 0 && expiresAt <= System.currentTimeMillis()) {
+                    // Tin nhan den sau thoi diem het han, khong hien thi
+                    return;
+                }
                 dispatchUi(() -> listener.onMessageReceived(
                         envelope.getFrom(), content,
-                        envelope.getId(), envelope.getTs()));
+                        envelope.getId(), envelope.getTs(), expiresAt));
             } catch (GeneralSecurityException
                     | e2ee.common.json.JsonParseException
                     | SecurityException e) {
@@ -920,9 +940,12 @@ public final class ChatClientController implements AutoCloseable {
                     if (closed) {
                         return;
                     }
-                    listener.onMessageReceived(
-                            original.getFrom(), result.getDecryptedContent(),
-                            original.getId(), original.getTs());
+                    if (!result.isExpired()) {
+                        listener.onMessageReceived(
+                                original.getFrom(), result.getDecryptedContent(),
+                                original.getId(), original.getTs(),
+                                result.getExpiresAt());
+                    }
                     if (currentIdentity == identity
                             && state == State.CONNECTED) {
                         sendAsync(result.getAckEnvelope());
@@ -1258,6 +1281,11 @@ public final class ChatClientController implements AutoCloseable {
 
         default void onMessageReceived(String senderUsername, String content,
                 String messageId, long timestamp) {
+        }
+
+        default void onMessageReceived(String senderUsername, String content,
+                String messageId, long timestamp, long expiresAt) {
+            onMessageReceived(senderUsername, content, messageId, timestamp);
         }
 
         default void onSecurityWarning(String username, String message) {

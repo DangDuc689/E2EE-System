@@ -115,6 +115,19 @@ public class ClientMain {
                         || state == ChatClientController.State.AUTHENTICATING;
                 loginFrame.setBusy(busy);
             }
+            if (chatFrame != null) {
+                switch (state) {
+                    case CONNECTED ->
+                        chatFrame.setServerStatus("Máy chủ: Đã kết nối",
+                                ChatFrame.SERVER_CONNECTED_COLOR);
+                    case CONNECTING, AUTHENTICATING, RECONNECTING ->
+                        chatFrame.setServerStatus("Máy chủ: Đang kết nối...",
+                                ChatFrame.SERVER_RECONNECTING_COLOR);
+                    case DISCONNECTED, CLOSED ->
+                        chatFrame.setServerStatus("Máy chủ: Mất kết nối",
+                                ChatFrame.SERVER_DISCONNECTED_COLOR);
+                }
+            }
         }
 
         @Override
@@ -133,6 +146,8 @@ public class ClientMain {
             if (chatFrame != null) {
                 chatFrame.showBanner("Mất kết nối: " + message,
                         ChatFrame.BannerType.ERROR);
+                chatFrame.setServerStatus("Máy chủ: Mất kết nối",
+                        ChatFrame.SERVER_DISCONNECTED_COLOR);
             }
         }
 
@@ -143,6 +158,8 @@ public class ClientMain {
                 chatFrame.showBanner("Đang kết nối lại lần " + attempt
                         + " sau " + (delayMs / 1000.0) + " giây...",
                         ChatFrame.BannerType.WARNING);
+                chatFrame.setServerStatus("Máy chủ: Đang kết nối...",
+                        ChatFrame.SERVER_RECONNECTING_COLOR);
             }
         }
 
@@ -151,6 +168,8 @@ public class ClientMain {
             if (chatFrame != null) {
                 chatFrame.showBanner("Đã kết nối lại an toàn",
                         ChatFrame.BannerType.CONNECTED);
+                chatFrame.setServerStatus("Máy chủ: Đã kết nối",
+                        ChatFrame.SERVER_CONNECTED_COLOR);
             }
         }
 
@@ -215,11 +234,17 @@ public class ClientMain {
         @Override
         public void onMessageReceived(String senderUsername, String content,
                 String messageId, long timestamp) {
+            onMessageReceived(senderUsername, content, messageId, timestamp, 0L);
+        }
+
+        @Override
+        public void onMessageReceived(String senderUsername, String content,
+                String messageId, long timestamp, long expiresAt) {
             if (chatFrame != null) {
                 chatFrame.updatePresence(senderUsername,
                         controller.isPeerOnline(senderUsername));
-                chatFrame.addMessage(senderUsername,
-                        content, timestamp, false);
+                chatFrame.addMessageWithExpiry(senderUsername,
+                        content, timestamp, false, expiresAt);
             }
         }
 

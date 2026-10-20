@@ -10,18 +10,23 @@ import javax.swing.JScrollPane;
 import javax.swing.JTextArea;
 import java.awt.BorderLayout;
 import java.awt.Color;
+import java.awt.Cursor;
 import java.awt.Dimension;
 import java.awt.Font;
+import java.awt.Graphics;
+import java.awt.Graphics2D;
 import java.awt.GridBagConstraints;
 import java.awt.GridBagLayout;
 import java.awt.Insets;
+import java.awt.RenderingHints;
 import java.util.Objects;
 
 /**
  * Hộp thoại đối soát fingerprint qua một kênh ngoài đáng tin cậy.
  */
 public final class FingerprintDialog extends JDialog {
-    private static final Color SAFE = new Color(22, 101, 52);
+    private static final Color PRIMARY_BLUE = new Color(37, 99, 235);
+    private static final Color PRIMARY_HOVER = new Color(29, 78, 216);
     private static final Color WARNING = new Color(185, 28, 28);
 
     public FingerprintDialog(JFrame owner, String peerUsername,
@@ -49,7 +54,7 @@ public final class FingerprintDialog extends JDialog {
                 ? "CẢNH BÁO: KHÓA BẢO MẬT ĐÃ THAY ĐỔI"
                 : "Đối soát khóa mã hóa đầu cuối");
         heading.setFont(heading.getFont().deriveFont(Font.BOLD, 18f));
-        heading.setForeground(keyChanged ? WARNING : SAFE);
+        heading.setForeground(keyChanged ? WARNING : PRIMARY_BLUE);
         root.add(heading, BorderLayout.NORTH);
 
         JPanel fingerprints = new JPanel(new GridBagLayout());
@@ -79,11 +84,8 @@ public final class FingerprintDialog extends JDialog {
         root.add(fingerprints, BorderLayout.CENTER);
 
         JPanel buttons = new JPanel(new BorderLayout(8, 0));
-        JButton cancelButton = new JButton("Đóng");
-        JButton confirmButton = new JButton(
-                "Đã đối soát an toàn qua kênh ngoài");
-        confirmButton.setBackground(new Color(37, 99, 235));
-        confirmButton.setForeground(Color.WHITE);
+        JButton cancelButton = createSecondaryButton("Đóng");
+        JButton confirmButton = createPrimaryButton("Đã đối soát an toàn qua kênh ngoài");
         cancelButton.addActionListener(event -> dispose());
         confirmButton.addActionListener(event -> {
             confirmAction.run();
@@ -93,6 +95,66 @@ public final class FingerprintDialog extends JDialog {
         buttons.add(confirmButton, BorderLayout.EAST);
         root.add(buttons, BorderLayout.SOUTH);
         setContentPane(root);
+    }
+
+    private static JButton createPrimaryButton(String text) {
+        JButton btn = new JButton(text) {
+            @Override
+            protected void paintComponent(Graphics g) {
+                Graphics2D g2 = (Graphics2D) g.create();
+                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                if (getModel().isPressed()) {
+                    g2.setColor(PRIMARY_HOVER.darker());
+                } else if (getModel().isRollover()) {
+                    g2.setColor(PRIMARY_HOVER);
+                } else {
+                    g2.setColor(PRIMARY_BLUE);
+                }
+                g2.fillRoundRect(0, 0, getWidth(), getHeight(), 6, 6);
+                g2.dispose();
+                super.paintComponent(g);
+            }
+        };
+        btn.setOpaque(false);
+        btn.setContentAreaFilled(false);
+        btn.setBorderPainted(false);
+        btn.setFocusPainted(false);
+        btn.setForeground(Color.WHITE);
+        btn.setFont(btn.getFont().deriveFont(Font.BOLD, 13f));
+        btn.setBorder(BorderFactory.createEmptyBorder(8, 18, 8, 18));
+        btn.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        return btn;
+    }
+
+    private static JButton createSecondaryButton(String text) {
+        JButton btn = new JButton(text) {
+            @Override
+            protected void paintComponent(Graphics g) {
+                Graphics2D g2 = (Graphics2D) g.create();
+                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                if (getModel().isPressed()) {
+                    g2.setColor(new Color(226, 232, 240));
+                } else if (getModel().isRollover()) {
+                    g2.setColor(new Color(241, 245, 249));
+                } else {
+                    g2.setColor(Color.WHITE);
+                }
+                g2.fillRoundRect(0, 0, getWidth() - 1, getHeight() - 1, 6, 6);
+                g2.setColor(new Color(203, 213, 225));
+                g2.drawRoundRect(0, 0, getWidth() - 1, getHeight() - 1, 6, 6);
+                g2.dispose();
+                super.paintComponent(g);
+            }
+        };
+        btn.setOpaque(false);
+        btn.setContentAreaFilled(false);
+        btn.setBorderPainted(false);
+        btn.setFocusPainted(false);
+        btn.setForeground(new Color(51, 65, 85));
+        btn.setFont(btn.getFont().deriveFont(Font.PLAIN, 13f));
+        btn.setBorder(BorderFactory.createEmptyBorder(8, 18, 8, 18));
+        btn.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        return btn;
     }
 
     private static JScrollPane createFingerprintArea(String fingerprint) {

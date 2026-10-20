@@ -3,9 +3,9 @@ package e2ee.client;
 import e2ee.client.identity.ClientIdentityStore;
 import e2ee.client.security.LocalTrustStore;
 import e2ee.client.ui.ChatFrame;
+import e2ee.client.ui.FingerprintDialog;
 import e2ee.client.ui.LoginFrame;
 
-import javax.swing.JOptionPane;
 import javax.swing.SwingUtilities;
 import javax.swing.UIManager;
 import java.io.IOException;
@@ -93,12 +93,14 @@ public class ClientMain {
         }
 
         @Override
+        public void onSendMessage(String username, String content,
+                int ttlSeconds) {
+            controller.sendMessage(username, content, ttlSeconds);
+        }
+
+        @Override
         public void onOpenSecurity(String username) {
-            JOptionPane.showMessageDialog(chatFrame,
-                    "Đối soát fingerprint của " + username
-                    + " sẽ được hoàn thiện trong Issue #14.",
-                    "Đối soát bảo mật",
-                    JOptionPane.INFORMATION_MESSAGE);
+            controller.requestFingerprintDetails(username);
         }
 
         @Override
@@ -112,6 +114,19 @@ public class ClientMain {
                 boolean busy = state == ChatClientController.State.CONNECTING
                         || state == ChatClientController.State.AUTHENTICATING;
                 loginFrame.setBusy(busy);
+            }
+            if (chatFrame != null) {
+                switch (state) {
+                    case CONNECTED ->
+                        chatFrame.setServerStatus("Máy chủ: Đã kết nối",
+                                ChatFrame.SERVER_CONNECTED_COLOR);
+                    case CONNECTING, AUTHENTICATING, RECONNECTING ->
+                        chatFrame.setServerStatus("Máy chủ: Đang kết nối...",
+                                ChatFrame.SERVER_RECONNECTING_COLOR);
+                    case DISCONNECTED, CLOSED ->
+                        chatFrame.setServerStatus("Máy chủ: Mất kết nối",
+                                ChatFrame.SERVER_DISCONNECTED_COLOR);
+                }
             }
         }
 
@@ -131,6 +146,8 @@ public class ClientMain {
             if (chatFrame != null) {
                 chatFrame.showBanner("Mất kết nối: " + message,
                         ChatFrame.BannerType.ERROR);
+                chatFrame.setServerStatus("Máy chủ: Mất kết nối",
+                        ChatFrame.SERVER_DISCONNECTED_COLOR);
             }
         }
 
@@ -141,6 +158,8 @@ public class ClientMain {
                 chatFrame.showBanner("Đang kết nối lại lần " + attempt
                         + " sau " + (delayMs / 1000.0) + " giây...",
                         ChatFrame.BannerType.WARNING);
+                chatFrame.setServerStatus("Máy chủ: Đang kết nối...",
+                        ChatFrame.SERVER_RECONNECTING_COLOR);
             }
         }
 
@@ -149,6 +168,8 @@ public class ClientMain {
             if (chatFrame != null) {
                 chatFrame.showBanner("Đã kết nối lại an toàn",
                         ChatFrame.BannerType.CONNECTED);
+                chatFrame.setServerStatus("Máy chủ: Đã kết nối",
+                        ChatFrame.SERVER_CONNECTED_COLOR);
             }
         }
 
@@ -178,7 +199,7 @@ public class ClientMain {
                 chatFrame.updatePresence(username,
                         controller.isPeerOnline(username));
                 chatFrame.selectPeer(username);
-                chatFrame.setPeerSendAllowed(username, false);
+                chatFrame.setPeerSecurityWarning(username, true);
                 chatFrame.showBanner(
                         "CẢNH BÁO: Khóa của " + username
                         + " đã thay đổi. Đã khóa gửi tin.",
@@ -196,20 +217,34 @@ public class ClientMain {
         @Override
         public void onMessageSent(String recipientUsername, String content,
                 String messageId, long timestamp) {
+            onMessageSentWithTtl(recipientUsername, content,
+                    messageId, timestamp, 0);
+        }
+
+        @Override
+        public void onMessageSentWithTtl(String recipientUsername,
+                String content, String messageId, long timestamp,
+                int ttlSeconds) {
             if (chatFrame != null) {
                 chatFrame.addMessage(recipientUsername,
-                        content, timestamp, true);
+                        content, timestamp, true, ttlSeconds);
             }
         }
 
         @Override
         public void onMessageReceived(String senderUsername, String content,
                 String messageId, long timestamp) {
+            onMessageReceived(senderUsername, content, messageId, timestamp, 0L);
+        }
+
+        @Override
+        public void onMessageReceived(String senderUsername, String content,
+                String messageId, long timestamp, long expiresAt) {
             if (chatFrame != null) {
                 chatFrame.updatePresence(senderUsername,
                         controller.isPeerOnline(senderUsername));
-                chatFrame.addMessage(senderUsername,
-                        content, timestamp, false);
+                chatFrame.addMessageWithExpiry(senderUsername,
+                        content, timestamp, false, expiresAt);
             }
         }
 
@@ -219,6 +254,32 @@ public class ClientMain {
                 chatFrame.showBanner("Cảnh báo bảo mật từ "
                         + username + ": " + message,
                         ChatFrame.BannerType.ERROR);
+            }
+        }
+
+        @Override
+        public void onFingerprintDetails(String username,
+                String myFingerprint, String peerFingerprint,
+                boolean keyChanged) {
+            if (chatFrame == null) {
+                return;
+            }
+            FingerprintDialog dialog = new FingerprintDialog(
+                    chatFrame, username, myFingerprint, peerFingerprint,
+                    keyChanged, () -> controller.acceptPeerKey(
+                            username, peerFingerprint));
+            dialog.setVisible(true);
+        }
+
+        @Override
+        public void onPeerTrustRestored(String username,
+                String fingerprint) {
+            if (chatFrame != null) {
+                chatFrame.setPeerSecurityWarning(username, false);
+                chatFrame.setPeerSendAllowed(username, true);
+                chatFrame.showBanner(
+                        "Đã xác minh lại khóa của " + username,
+                        ChatFrame.BannerType.CONNECTED);
             }
         }
 

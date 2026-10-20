@@ -23,6 +23,11 @@ public final class MessageBubble extends JPanel {
             DateTimeFormatter.ofPattern("HH:mm");
 
     public MessageBubble(String content, long timestamp, boolean sentByMe) {
+        this(content, timestamp, sentByMe, 0);
+    }
+
+    public MessageBubble(String content, long timestamp, boolean sentByMe,
+            int remainingSeconds) {
         super(new BorderLayout());
         setOpaque(false);
         setBorder(BorderFactory.createEmptyBorder(4, 10, 4, 10));
@@ -49,7 +54,10 @@ public final class MessageBubble extends JPanel {
 
         JLabel time = new JLabel(TIME_FORMAT.format(
                 Instant.ofEpochMilli(timestamp)
-                        .atZone(ZoneId.systemDefault())));
+                        .atZone(ZoneId.systemDefault()))
+                + (remainingSeconds > 0
+                        ? "  ·  tự hủy sau " + remainingSeconds + "s"
+                        : ""));
         time.setFont(time.getFont().deriveFont(Font.PLAIN, 10f));
         time.setForeground(sentByMe
                 ? new Color(219, 234, 254) : new Color(100, 116, 139));

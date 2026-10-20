@@ -61,6 +61,7 @@ public final class OfflineQueueAcceptanceTest {
         // 3. Kiểm thử logic định tuyến Store-and-Forward trong bộ nhớ
         testOfflineQueueRouter1to1();
         testGroupRouterOfflineQueue();
+        testOfflineQueueEventClassificationAndMetrics();
 
         // 4. Kiểm thử Chống phát lại (Anti-Replay) & At-least-once phía Client
         testAntiReplayOnOfflineSync();
@@ -261,6 +262,75 @@ public final class OfflineQueueAcceptanceTest {
             TestSupport.assertEquals(0, offlineQueue.getQueueSize("alice"));
 
             System.out.println("✔ Tin nhắn nhóm được tự động nhân bản vào hàng đợi của tất cả thành viên offline.");
+        });
+    }
+
+    private static void testOfflineQueueEventClassificationAndMetrics() {
+        TestSupport.check("Test 6b: Phân loại sự kiện Offline Queue thành INFO, không làm tăng bộ đếm Cảnh báo/Lỗi", () -> {
+            ConcurrentMap<String, ClientHandler> onlineUsers = new ConcurrentHashMap<>();
+            OfflineMessageQueue offlineQueue = new OfflineMessageQueue();
+            OfflineQueueRouter router = new OfflineQueueRouter(onlineUsers, offlineQueue, null);
+
+            List<ServerLogEntry> receivedEvents = new ArrayList<>();
+            java.util.concurrent.atomic.AtomicInteger warningAndErrorCount = new java.util.concurrent.atomic.AtomicInteger(0);
+
+            router.setEventListener(entry -> {
+                receivedEvents.add(entry);
+                if ("WARN".equalsIgnoreCase(entry.level()) || "ERROR".equalsIgnoreCase(entry.level())) {
+                    warningAndErrorCount.incrementAndGet();
+                }
+            });
+
+            // 1. Gửi tin cho người nhận offline (bob)
+            Envelope env = Envelope.create(Opcode.CHAT_1TO1, "alice", "bob");
+            env.setId("msg-event-offline-01");
+            router.route(env, null);
+
+            // Xác minh hàng đợi tăng
+            TestSupport.assertEquals(1, offlineQueue.getQueueSize("bob"));
+            // Xác minh sự kiện phát ra là INFO, không phải WARN
+            TestSupport.assertEquals(1, receivedEvents.size());
+            ServerLogEntry offlineEvent = receivedEvents.get(0);
+            TestSupport.assertEquals("INFO", offlineEvent.level());
+            TestSupport.assertEquals("MSG_OFFLINE", offlineEvent.event());
+            TestSupport.assertEquals("bob", offlineEvent.username());
+            TestSupport.assertTrue(offlineEvent.details().contains("alice"), "Chi tiết phải chứa tên người gửi alice");
+            TestSupport.assertTrue(offlineEvent.details().contains("1/" + OfflineMessageQueue.MAX_QUEUE_PER_USER), "Chi tiết phải chứa kích thước queue");
+            // Bộ đếm Cảnh báo/Lỗi không tăng (vẫn bằng 0)
+            TestSupport.assertEquals(0, warningAndErrorCount.get());
+
+            // 2. ACK / queue giảm
+            boolean removed = offlineQueue.acknowledge("bob", "msg-event-offline-01");
+            TestSupport.assertTrue(removed, "ACK phải giải phóng tin thành công");
+            TestSupport.assertEquals(0, offlineQueue.getQueueSize("bob"));
+            TestSupport.assertEquals(0, warningAndErrorCount.get());
+
+            // 3. Sự kiện WARN hoặc ERROR thực sự phải tăng bộ đếm đúng 1 lần và có log
+            ServerLogEntry realWarning = new ServerLogEntry(System.currentTimeMillis(), "WARN", "MAX_CLIENTS_REACHED", "-", "Đạt giới hạn 50 client");
+            ServerLogEntry realError = new ServerLogEntry(System.currentTimeMillis(), "ERROR", "SOCKET_ERROR", "alice", "Mất kết nối đột ngột");
+
+            for (ServerLogEntry e : List.of(realWarning, realError)) {
+                receivedEvents.add(e);
+                if ("WARN".equalsIgnoreCase(e.level()) || "ERROR".equalsIgnoreCase(e.level())) {
+                    warningAndErrorCount.incrementAndGet();
+                }
+            }
+            TestSupport.assertEquals(2, warningAndErrorCount.get());
+            TestSupport.assertEquals(3, receivedEvents.size());
+
+            // 4. Kiểm tra logic bộ lọc log
+            long allCount = receivedEvents.stream().count();
+            TestSupport.assertEquals(3, (int) allCount);
+
+            long infoCount = receivedEvents.stream().filter(e -> "INFO".equalsIgnoreCase(e.level())).count();
+            TestSupport.assertEquals(1, (int) infoCount);
+
+            long warnCount = receivedEvents.stream().filter(e -> "WARN".equalsIgnoreCase(e.level())).count();
+            TestSupport.assertEquals(1, (int) warnCount);
+            long errorCount = receivedEvents.stream().filter(e -> "ERROR".equalsIgnoreCase(e.level())).count();
+            TestSupport.assertEquals(1, (int) errorCount);
+
+            System.out.println("✔ Sự kiện MSG_OFFLINE phân loại đúng mức INFO; bộ đếm cảnh báo không tăng; bộ lọc log hoạt động chính xác.");
         });
     }
 

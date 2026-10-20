@@ -18,6 +18,18 @@ public final class Default1to1Router implements MessageRouter {
     private final ConcurrentMap<String, ClientHandler> onlineUsers;
     private final ConcurrentMap<String, String> publicKeyRegistry;
     private final RoutedEnvelopeSender routedEnvelopeSender;
+    private volatile ServerEventListener eventListener;
+
+    public void setEventListener(ServerEventListener listener) {
+        this.eventListener = listener;
+    }
+
+    private void notifyEvent(String level, String event, String username, String details) {
+        ServerEventListener listener = this.eventListener;
+        if (listener != null) {
+            listener.onEvent(new ServerLogEntry(System.currentTimeMillis(), level, event, username, details));
+        }
+    }
 
     public Default1to1Router(
             ConcurrentMap<String, ClientHandler> onlineUsers,
@@ -49,9 +61,14 @@ public final class Default1to1Router implements MessageRouter {
         ForwardResult result = recipientUsername == null
                 ? ForwardResult.OFFLINE
                 : sendToCurrentRecipient(recipientUsername, env);
-        if (result == ForwardResult.OFFLINE) {
+        if (result == ForwardResult.SENT) {
+            notifyEvent("INFO", "MSG_RELAY", env.getFrom(),
+                    "Chuyển tiếp gói tin mã hóa AES-GCM đến " + recipientUsername);
+        } else if (result == ForwardResult.OFFLINE) {
             sender.sendRouterError(
                     "RECIPIENT_OFFLINE", "User is offline");
+            notifyEvent("WARN", "RECIPIENT_OFFLINE", env.getFrom(),
+                    "Người nhận ngoại tuyến: " + recipientUsername);
         }
     }
 

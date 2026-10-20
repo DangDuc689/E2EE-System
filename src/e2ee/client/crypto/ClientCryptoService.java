@@ -141,28 +141,50 @@ public class ClientCryptoService {
      * - Bọc khóa AES bằng RSA-OAEP SHA-256 bằng Public Key của người nhận
      * - Sinh Canonical String: from|to|ek|iv|Base64(aad)|ct và ký số SHA256withRSA
      * - Đóng gói vào Envelope.body: {ek, iv, ct, sig}
+     */
+    public Envelope createEncrypted1to1Message(String from, String to, String content,
+                                               PublicKey peerKey, PrivateKey myKey)
+            throws GeneralSecurityException {
+        return createEncrypted1to1Message(from, to, content, peerKey, myKey, 0);
+    }
+
+    /**
+     * Mã hóa và ký số tin nhắn 1-1 với tùy chọn TTL (thời gian tự hủy):
+     * - Tự động tính toán expires_at tuyệt đối từ env.ts + ttl * 1000L nếu ttl > 0.
+     * - Đóng gói "content", "ttl", "expires_at" vào bên trong bản rõ JSON.
+     * - Bản rõ JSON được mã hóa AES-GCM-256 kết hợp AAD và ký số SHA256withRSA.
      *
      * @param from Tên người gửi
      * @param to Tên người nhận
      * @param content Nội dung tin nhắn bản rõ
      * @param peerKey Khóa công khai của người nhận
      * @param myKey Khóa riêng của người gửi
+     * @param ttlSeconds Thời gian sống tính bằng giây (0 = không tự hủy)
      * @return Gói tin Envelope CHAT_1TO1 sẵn sàng gửi qua mạng
      * @throws GeneralSecurityException khi xảy ra lỗi mã hóa hoặc ký số
      */
     public Envelope createEncrypted1to1Message(String from, String to, String content,
-                                               PublicKey peerKey, PrivateKey myKey)
+                                               PublicKey peerKey, PrivateKey myKey,
+                                               int ttlSeconds)
             throws GeneralSecurityException {
         if (from == null || to == null || content == null || peerKey == null || myKey == null) {
             throw new IllegalArgumentException("Cac tham so khong duoc null");
+        }
+        if (ttlSeconds < 0 || ttlSeconds > 86_400) {
+            throw new IllegalArgumentException("TTL khong hop le");
         }
 
         // 1. Tạo Envelope với Opcode CHAT_1TO1
         Envelope env = Envelope.create(Opcode.CHAT_1TO1, from, to);
 
-        // 2. Định dạng bản rõ trước khi mã hóa: JSON string {"content": "..."}
+        // 2. Định dạng bản rõ trước khi mã hóa: JSON string {"content": "..."} kèm ttl/expires_at nếu có
         Map<String, Object> plaintextJsonMap = new LinkedHashMap<>();
         plaintextJsonMap.put("content", content);
+        if (ttlSeconds > 0) {
+            long expiresAt = env.getTs() + (long) ttlSeconds * 1_000L;
+            plaintextJsonMap.put("ttl", (long) ttlSeconds);
+            plaintextJsonMap.put("expires_at", expiresAt);
+        }
         String plaintextJson = MiniJson.stringify(plaintextJsonMap);
         byte[] plaintextBytes = plaintextJson.getBytes(StandardCharsets.UTF_8);
 
@@ -221,12 +243,54 @@ public class ClientCryptoService {
         return DEFAULT_INSTANCE.createEncrypted1to1Message(from, to, content, peerKey, myKey);
     }
 
+    public static Envelope createEncrypted1to1MessageStatic(String from, String to, String content,
+                                                            PublicKey peerKey, PrivateKey myKey,
+                                                            int ttlSeconds)
+            throws GeneralSecurityException {
+        return DEFAULT_INSTANCE.createEncrypted1to1Message(from, to, content, peerKey, myKey, ttlSeconds);
+    }
+
     // =========================================================================
     // 4. XÁC MINH VÀ GIẢI MÃ TIN NHẮN E2EE 1-1
     // =========================================================================
 
     /**
-     * Xác minh chữ ký số và giải mã tin nhắn E2EE 1-1:
+     * DTO chứa kết quả giải mã tin nhắn 1-1 gồm nội dung, thời điểm hết hạn và TTL.
+     */
+    public static final class Decrypted1to1Message {
+        private final String content;
+        private final long expiresAt;
+        private final int ttlSeconds;
+
+        public Decrypted1to1Message(String content, long expiresAt, int ttlSeconds) {
+            this.content = content != null ? content : "";
+            this.expiresAt = Math.max(0L, expiresAt);
+            this.ttlSeconds = Math.max(0, ttlSeconds);
+        }
+
+        public String getContent() {
+            return content;
+        }
+
+        public long getExpiresAt() {
+            return expiresAt;
+        }
+
+        public int getTtlSeconds() {
+            return ttlSeconds;
+        }
+
+        public boolean isExpired() {
+            return isExpired(System.currentTimeMillis());
+        }
+
+        public boolean isExpired(long now) {
+            return expiresAt > 0 && expiresAt <= now;
+        }
+    }
+
+    /**
+     * Xác minh chữ ký số và giải mã tin nhắn E2EE 1-1, trả về đối tượng Decrypted1to1Message đầy đủ:
      * - Kiểm tra Anti-Replay sơ bộ:
      *   + Nếu là tin live: từ chối nếu timestamp lệch quá +-120 giây hoặc id đã có trong cache.
      *   + Nếu là tin offline sync: bỏ qua kiểm tra timestamp, chỉ từ chối nếu id đã có trong cache.
@@ -234,21 +298,12 @@ public class ClientCryptoService {
      * - Tái tạo Canonical Form: from|to|ek|iv|Base64(aad)|ct.
      * - XÁC MINH CHỮ KÝ TRƯỚC KHI GIẢI MÃ bằng Public Key của người gửi.
      * - Mở bọc khóa AES qua RSA-OAEP SHA-256 bằng Private Key của mình.
-     * - Giải mã AES-GCM với AAD và khôi phục nội dung JSON.
+     * - Giải mã AES-GCM với AAD và khôi phục nội dung JSON ("content", "ttl", "expires_at").
      * - GHI NHẬN ID vào seenMessageIds CHỈ SAU KHI verify và giải mã thành công.
      * - Dọn dẹp RAM mảng byte giải mã nhạy cảm.
-     *
-     * @param env Gói tin Envelope nhận được
-     * @param peerKey Public Key của người gửi (dùng để verify chữ ký)
-     * @param myKey Private Key của mình (dùng để unwrap khóa AES)
-     * @param isOfflineSync true nếu gói tin đến từ hàng đợi đồng bộ offline, false nếu tin nhắn live
-     * @return Chuỗi nội dung tin nhắn ban đầu (trường "content")
-     * @throws SecurityException khi phát hiện phát lại, timestamp sai lệch hoặc chữ ký số không hợp lệ
-     * @throws GeneralSecurityException khi lỗi thuật toán mã hóa hoặc khóa không đúng
-     * @throws JsonParseException khi bản rõ giải mã ra không phải JSON hợp lệ
      */
-    public String verifyAndDecrypt1to1Message(Envelope env, PublicKey peerKey, PrivateKey myKey,
-                                              boolean isOfflineSync)
+    public Decrypted1to1Message verifyAndDecrypt1to1(Envelope env, PublicKey peerKey, PrivateKey myKey,
+                                                     boolean isOfflineSync)
             throws GeneralSecurityException, JsonParseException {
         if (env == null || peerKey == null || myKey == null) {
             throw new IllegalArgumentException("Tham so khong duoc null");
@@ -325,7 +380,7 @@ public class ClientCryptoService {
             // Giải mã AES-GCM với AAD
             plaintextBytes = ClientCryptoEngine.decryptAesGcm(ciphertextWithTag, aesKey, ivBytes, aadBytes);
 
-            // 8. Chuyển đổi bản rõ và trích xuất trường "content" từ JSON
+            // 8. Chuyển đổi bản rõ và trích xuất trường "content", "expires_at", "ttl" từ JSON
             String jsonPlaintext = new String(plaintextBytes, StandardCharsets.UTF_8);
             Map<String, Object> map = MiniJson.parseObject(jsonPlaintext);
             Object contentObj = map.get("content");
@@ -333,15 +388,43 @@ public class ClientCryptoService {
                 throw new SecurityException("Ban ro JSON thieu truong 'content': " + jsonPlaintext);
             }
 
+            long expiresAt = 0L;
+            Object expObj = map.get("expires_at");
+            if (expObj instanceof Number num) {
+                expiresAt = num.longValue();
+            } else {
+                Object ttlVal = map.get("ttl");
+                if (ttlVal instanceof Number num && num.longValue() > 0) {
+                    expiresAt = env.getTs() + num.longValue() * 1_000L;
+                }
+            }
+
+            int ttlSeconds = 0;
+            Object ttlVal = map.get("ttl");
+            if (ttlVal instanceof Number num) {
+                ttlSeconds = num.intValue();
+            } else if (expiresAt > env.getTs()) {
+                ttlSeconds = (int) ((expiresAt - env.getTs()) / 1_000L);
+            }
+
             // 9. BẤT BIẾN AN TOÀN: CHỈ ghi nhận ID vào seenMessageIds SAU KHI chữ ký & giải mã thành công!
             seenMessageIds.add(msgId);
 
-            return String.valueOf(contentObj);
+            return new Decrypted1to1Message(String.valueOf(contentObj), expiresAt, ttlSeconds);
         } finally {
             // Dọn dẹp RAM an toàn
             wipeMemory(wrappedKeyBytes);
             wipeMemory(plaintextBytes);
         }
+    }
+
+    /**
+     * Phương thức tiện ích xác minh và giải mã trả về nội dung text (tương thích ngược).
+     */
+    public String verifyAndDecrypt1to1Message(Envelope env, PublicKey peerKey, PrivateKey myKey,
+                                              boolean isOfflineSync)
+            throws GeneralSecurityException, JsonParseException {
+        return verifyAndDecrypt1to1(env, peerKey, myKey, isOfflineSync).getContent();
     }
 
     /**
@@ -351,6 +434,12 @@ public class ClientCryptoService {
                                                            PrivateKey myKey, boolean isOfflineSync)
             throws GeneralSecurityException, JsonParseException {
         return DEFAULT_INSTANCE.verifyAndDecrypt1to1Message(env, peerKey, myKey, isOfflineSync);
+    }
+
+    public static Decrypted1to1Message verifyAndDecrypt1to1Static(Envelope env, PublicKey peerKey,
+                                                                 PrivateKey myKey, boolean isOfflineSync)
+            throws GeneralSecurityException, JsonParseException {
+        return DEFAULT_INSTANCE.verifyAndDecrypt1to1(env, peerKey, myKey, isOfflineSync);
     }
 
     // =========================================================================

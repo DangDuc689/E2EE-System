@@ -2,6 +2,7 @@ package e2ee.client.crypto;
 
 import e2ee.common.codec.EnvelopeMapper;
 import e2ee.common.contract.Envelope;
+import e2ee.common.contract.MessageLimits;
 import e2ee.common.contract.Opcode;
 import e2ee.common.json.JsonParseException;
 
@@ -104,11 +105,14 @@ public class OfflineSyncService {
             throw new IllegalArgumentException("Goi tin goc phai co opcode la CHAT_1TO1, nhan duoc: " + original.getOp());
         }
 
-        String content = clientCryptoService.verifyAndDecrypt1to1Message(
-                original, senderPublicKey, myPrivateKey, true);
+        ClientCryptoService.Decrypted1to1Message decrypted =
+                clientCryptoService.verifyAndDecrypt1to1(
+                        original, senderPublicKey, myPrivateKey, true);
+        String content = decrypted.getContent();
+        MessageLimits.requireWithinLimit(content);
         Envelope ack = createAckEnvelope(myUsername, original.getId());
 
-        return new SyncResult(original, content, ack);
+        return new SyncResult(original, content, ack, decrypted.getExpiresAt());
     }
 
     /**
@@ -139,7 +143,7 @@ public class OfflineSyncService {
                 original, myUsername, senderPublicKey, myPrivateKey, expectedMembersHash, true);
         Envelope ack = createAckEnvelope(myUsername, original.getId());
 
-        return new SyncResult(original, content, ack);
+        return new SyncResult(original, content, ack, 0L);
     }
 
     /**
@@ -149,11 +153,17 @@ public class OfflineSyncService {
         private final Envelope originalEnvelope;
         private final String decryptedContent;
         private final Envelope ackEnvelope;
+        private final long expiresAt;
 
         public SyncResult(Envelope originalEnvelope, String decryptedContent, Envelope ackEnvelope) {
+            this(originalEnvelope, decryptedContent, ackEnvelope, 0L);
+        }
+
+        public SyncResult(Envelope originalEnvelope, String decryptedContent, Envelope ackEnvelope, long expiresAt) {
             this.originalEnvelope = originalEnvelope;
             this.decryptedContent = decryptedContent;
             this.ackEnvelope = ackEnvelope;
+            this.expiresAt = Math.max(0L, expiresAt);
         }
 
         public Envelope getOriginalEnvelope() {
@@ -166,6 +176,18 @@ public class OfflineSyncService {
 
         public Envelope getAckEnvelope() {
             return ackEnvelope;
+        }
+
+        public long getExpiresAt() {
+            return expiresAt;
+        }
+
+        public boolean isExpired() {
+            return isExpired(System.currentTimeMillis());
+        }
+
+        public boolean isExpired(long now) {
+            return expiresAt > 0 && expiresAt <= now;
         }
     }
 }

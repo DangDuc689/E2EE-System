@@ -47,6 +47,23 @@ final class ClientHandler implements Runnable {
     private boolean authenticated;
     private String authenticatedUsername;
     private volatile SocketPacketChannel presenceChannel;
+    private final long connectedAt = System.currentTimeMillis();
+    private volatile ServerEventListener eventListener;
+
+    public long getConnectedAt() {
+        return connectedAt;
+    }
+
+    public void setEventListener(ServerEventListener listener) {
+        this.eventListener = listener;
+    }
+
+    private void notifyEvent(String level, String event, String username, String details) {
+        ServerEventListener listener = this.eventListener;
+        if (listener != null) {
+            listener.onEvent(new ServerLogEntry(System.currentTimeMillis(), level, event, username, details));
+        }
+    }
 
     ClientHandler(Socket clientSocket) {
         this(clientSocket, () -> {
@@ -166,6 +183,8 @@ final class ClientHandler implements Runnable {
             System.out.println("[E2EE-SERVER] Client da ket noi: "
                     + clientAddress
                     + " | Thread: " + Thread.currentThread().getName());
+            notifyEvent("INFO", "CLIENT_CONNECT", "-",
+                    "Chấp nhận kết nối socket TCP mới: " + clientAddress);
 
             /*
              * ==============================================
@@ -235,6 +254,9 @@ final class ClientHandler implements Runnable {
         } catch (SocketTimeoutException e) {
             System.out.println("[E2EE-SERVER] Client khong hoat dong trong 90 giay: "
                     + clientAddress);
+            notifyEvent("WARN", "CLIENT_TIMEOUT",
+                    authenticatedUsername != null ? authenticatedUsername : "-",
+                    "Client không hoạt động trong 90 giây: " + clientAddress);
         } catch (EOFException e) {
             System.out.println("[E2EE-SERVER] Client da dong ket noi (EOF): "
                     + clientAddress);
@@ -242,6 +264,9 @@ final class ClientHandler implements Runnable {
             if (!clientSocket.isClosed()) {
                 System.err.println("[E2EE-SERVER] Loi ket noi client: "
                         + clientAddress + " - " + e.getMessage());
+                notifyEvent("ERROR", "SOCKET_ERROR",
+                        authenticatedUsername != null ? authenticatedUsername : "-",
+                        "Lỗi kết nối client: " + e.getMessage());
             }
         } finally {
             destroyChallengeNonce();
@@ -251,6 +276,9 @@ final class ClientHandler implements Runnable {
             presenceChannel = null;
             onClose.run();
             System.out.println("[E2EE-SERVER] Da cleanup client: " + clientAddress);
+            notifyEvent("INFO", "CLIENT_DISCONNECT",
+                    authenticatedUsername != null ? authenticatedUsername : "-",
+                    "Client đã ngắt kết nối: " + clientAddress);
         }
     }
 
@@ -289,12 +317,15 @@ final class ClientHandler implements Runnable {
                         username, signatureBase64, publicKeyBase64)) {
             destroyChallengeNonce();
             sendError(channel, username, "AUTH_FAILED", "Authentication failed");
+            notifyEvent("WARN", "AUTH_FAIL", username, "Xác thực chữ ký số RSA thất bại");
             return false;
         }
 
         authenticatedUsername = username;
         authenticated = true;
         destroyChallengeNonce();
+        notifyEvent("INFO", "SESSION_AUTH", username,
+                "Xác thực khóa công khai RSA-2048 thành công");
 
         PresenceDispatcher.Registration registration =
                 presenceDispatcher.register(username, this);
@@ -386,7 +417,7 @@ final class ClientHandler implements Runnable {
         closeReplacedSession();
     }
 
-    String authenticatedUsername() {
+    public String authenticatedUsername() {
         return authenticatedUsername;
     }
 

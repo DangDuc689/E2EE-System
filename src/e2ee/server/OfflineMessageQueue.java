@@ -4,7 +4,9 @@ import e2ee.common.contract.Envelope;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -151,5 +153,34 @@ public final class OfflineMessageQueue {
      */
     public void clearAll() {
         userQueues.clear();
+    }
+
+    /**
+     * Lấy tóm tắt số lượng tin nhắn đang chờ theo từng người dùng (chỉ đọc).
+     *
+     * @return Map chứa username và số lượng tin nhắn tương ứng
+     */
+    public Map<String, Integer> getQueueSummary() {
+        Map<String, Integer> summary = new LinkedHashMap<>();
+        for (Map.Entry<String, Queue<Envelope>> entry : userQueues.entrySet()) {
+            int size = entry.getValue().size();
+            if (size > 0) {
+                summary.put(entry.getKey(), size);
+            }
+        }
+        return Collections.unmodifiableMap(summary);
+    }
+
+    /**
+     * Lấy tổng số lượng tin nhắn đang chờ trong toàn bộ các hàng đợi.
+     *
+     * @return Tổng số tin nhắn
+     */
+    public int getTotalQueueSize() {
+        int total = 0;
+        for (Queue<Envelope> queue : userQueues.values()) {
+            total += queue.size();
+        }
+        return total;
     }
 }

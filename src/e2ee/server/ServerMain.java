@@ -42,6 +42,9 @@ public class ServerMain {
     private final ConcurrentMap<String, ClientHandler> onlineUsers = new ConcurrentHashMap<>();
     private final PresenceDispatcher presenceDispatcher = new PresenceDispatcher(onlineUsers);
     private final OfflineMessageQueue offlineQueue = new OfflineMessageQueue();
+    private final ConcurrentMap<String, Set<String>> groupRegistry;
+    private final ServerGroupStore groupStore;
+    private final int port;
     private final Default1to1Router default1to1Router;
     private final OfflineQueueRouter offlineQueueRouter;
     private final MessageRouter messageRouter;
@@ -52,23 +55,42 @@ public class ServerMain {
     private volatile long startedAt = 0L;
 
     public ServerMain() {
-        /*
-         * ==============================================
-         * BOUNDED THREAD POOL
-         * MAX CLIENTS - 50
-         * ==============================================
-         */
+        this(DEFAULT_PORT, null);
+    }
+
+    public ServerMain(int port) {
+        this(port, null);
+    }
+
+    public ServerMain(int port, ServerGroupStore customStore) {
+        this.port = port;
         default1to1Router = new Default1to1Router(onlineUsers, publicKeyRegistry);
         default1to1Router.setEventListener(this::notifyEvent);
 
         offlineQueueRouter = new OfflineQueueRouter(onlineUsers, offlineQueue, default1to1Router);
         offlineQueueRouter.setEventListener(this::notifyEvent);
 
+        if (customStore != null) {
+            this.groupStore = customStore;
+            this.groupRegistry = customStore.getGroupRegistry();
+        } else {
+            this.groupRegistry = new ConcurrentHashMap<>();
+            ServerGroupStore store;
+            try {
+                store = new ServerGroupStore(groupRegistry);
+            } catch (IOException e) {
+                System.err.println("[E2EE-SERVER] Loi khoi tao ServerGroupStore: " + e.getMessage());
+                throw new java.io.UncheckedIOException("Khong the khoi tao ServerGroupStore", e);
+            }
+            this.groupStore = store;
+        }
+
         messageRouter = new GroupRouter(
                 onlineUsers,
-                new ConcurrentHashMap<>(),
+                groupRegistry,
                 offlineQueue,
-                offlineQueueRouter);
+                offlineQueueRouter,
+                groupStore);
 
         clientExecutor = new ThreadPoolExecutor(
                 MAX_CLIENTS,
@@ -105,19 +127,23 @@ public class ServerMain {
          */
         ServerSocket listeningSocket;
         try {
+            if (groupStore != null) {
+                groupStore.load();
+            }
             synchronized (lifecycleLock) {
                 if (shuttingDown.get()) {
                     return;
                 }
-                listeningSocket = new ServerSocket(DEFAULT_PORT);
+                listeningSocket = new ServerSocket(port);
                 serverSocket = listeningSocket;
                 startedAt = System.currentTimeMillis();
             }
 
+            int boundPort = listeningSocket.getLocalPort();
             System.out.println("[E2EE-SERVER] Server da khoi dong.");
-            System.out.println("[E2EE-SERVER] Dang lang nghe tai port " + DEFAULT_PORT + ".");
+            System.out.println("[E2EE-SERVER] Dang lang nghe tai port " + boundPort + ".");
             notifyEvent("INFO", "SERVER_START", "server",
-                    "Server đã khởi động, đang lắng nghe tại port " + DEFAULT_PORT);
+                    "Server đã khởi động, đang lắng nghe tại port " + boundPort);
 
             while (!shuttingDown.get()) {
                 Socket clientSocket = listeningSocket.accept();
@@ -157,9 +183,9 @@ public class ServerMain {
         } catch (IOException e) {
             if (!shuttingDown.get()) {
                 System.err.println("[E2EE-SERVER] Khong the lang nghe tai port "
-                        + DEFAULT_PORT + ": " + e.getMessage());
+                        + port + ": " + e.getMessage());
                 notifyEvent("ERROR", "SERVER_ERROR", "server",
-                        "Không thể lắng nghe tại port " + DEFAULT_PORT + ": " + e.getMessage());
+                        "Không thể lắng nghe tại port " + port + ": " + e.getMessage());
             }
         } finally {
             shutdown();
@@ -253,6 +279,19 @@ public class ServerMain {
 
     public MessageRouter getMessageRouter() {
         return messageRouter;
+    }
+
+    public ServerGroupStore getGroupStore() {
+        return groupStore;
+    }
+
+    public ConcurrentMap<String, Set<String>> getGroupRegistry() {
+        return groupRegistry;
+    }
+
+    public int getPort() {
+        ServerSocket s = serverSocket;
+        return (s != null && !s.isClosed()) ? s.getLocalPort() : port;
     }
 
     public record SessionSnapshot(String username, long connectedAt, String status) {}

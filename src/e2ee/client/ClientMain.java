@@ -104,6 +104,16 @@ public class ClientMain {
         }
 
         @Override
+        public void onCreateGroup(String groupId, String groupName, java.util.List<String> memberUsernames) {
+            controller.createGroup(groupId, groupName, memberUsernames);
+        }
+
+        @Override
+        public void onSendGroupMessage(String groupId, String content, int ttlSeconds) {
+            controller.sendGroupMessage(groupId, content);
+        }
+
+        @Override
         public void onClose() {
             shutdown();
         }
@@ -280,6 +290,41 @@ public class ClientMain {
                 chatFrame.showBanner(
                         "Đã xác minh lại khóa của " + username,
                         ChatFrame.BannerType.CONNECTED);
+            }
+        }
+
+        @Override
+        public void onGroupCreated(String groupId, String groupName, java.util.List<String> members) {
+            if (chatFrame != null) {
+                chatFrame.addGroup(groupId, groupName, members);
+                chatFrame.selectPeer(groupId);
+                chatFrame.showBanner("Đã tạo nhóm '" + groupName + "' thành công",
+                        ChatFrame.BannerType.CONNECTED);
+            }
+        }
+
+        @Override
+        public void onGroupSnapshot(String groupId, String groupName, java.util.List<String> members) {
+            if (chatFrame != null) {
+                chatFrame.addGroup(groupId, groupName, members);
+            }
+        }
+
+        @Override
+        public void onGroupMessageSent(String groupId, String content,
+                String messageId, long timestamp) {
+            if (chatFrame != null) {
+                chatFrame.addGroupMessage(groupId, controller.getMyUsername(),
+                        content, timestamp, true, 0);
+            }
+        }
+
+        @Override
+        public void onGroupMessageReceived(String groupId, String senderUsername,
+                String content, String messageId, long timestamp) {
+            if (chatFrame != null) {
+                chatFrame.addGroupMessage(groupId, senderUsername,
+                        content, timestamp, false, 0);
             }
         }
 

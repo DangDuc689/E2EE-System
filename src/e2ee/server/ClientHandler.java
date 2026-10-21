@@ -336,8 +336,17 @@ final class ClientHandler implements Runnable {
         beforePresenceSnapshot.run();
         sendPresenceSnapshot(channel, registration.snapshot());
         presenceDispatcher.activate(username, this);
+        sendGroupSnapshotsIfAvailable(channel, username);
         sendOfflineSyncIfAvailable(channel, username);
         return true;
+    }
+
+    private void sendGroupSnapshotsIfAvailable(SocketPacketChannel channel, String username)
+            throws IOException {
+        GroupRouter gr = GroupRouter.findIn(messageRouter);
+        if (gr != null) {
+            gr.syncUserGroups(username, channel);
+        }
     }
 
     private void sendOfflineSyncIfAvailable(SocketPacketChannel channel, String username)

@@ -6,11 +6,13 @@ import e2ee.client.crypto.GroupCryptoService;
 import e2ee.client.crypto.OfflineSyncService;
 import e2ee.client.identity.ClientIdentityStore;
 import e2ee.client.identity.ClientIdentityStore.Identity;
+import e2ee.client.security.ClientGroupStore;
 import e2ee.client.security.LocalTrustStore;
 import e2ee.common.contract.Envelope;
 import e2ee.common.contract.MessageLimits;
 import e2ee.common.contract.Opcode;
 import e2ee.common.contract.PacketChannel;
+import e2ee.common.json.JsonParseException;
 import e2ee.common.net.SocketPacketChannel;
 
 import javax.swing.SwingUtilities;
@@ -19,8 +21,10 @@ import java.security.GeneralSecurityException;
 import java.security.PublicKey;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
@@ -48,6 +52,7 @@ public final class ChatClientController implements AutoCloseable {
     private final Object lifecycleLock = new Object();
     private final ClientIdentityStore identityStore;
     private final LocalTrustStore trustStore;
+    private final ClientGroupStore groupStore;
     private final ClientCryptoService cryptoService;
     private final OfflineSyncService offlineSyncService;
     private final ChannelConnector channelConnector;
@@ -114,10 +119,23 @@ public final class ChatClientController implements AutoCloseable {
             ChannelConnector channelConnector,
             long keepAliveIntervalSeconds,
             long[] reconnectDelaysMs) {
+        this(identityStore, trustStore, createDefaultGroupStore(), cryptoService, channelConnector,
+                keepAliveIntervalSeconds, reconnectDelaysMs);
+    }
+
+    ChatClientController(ClientIdentityStore identityStore,
+            LocalTrustStore trustStore,
+            ClientGroupStore groupStore,
+            ClientCryptoService cryptoService,
+            ChannelConnector channelConnector,
+            long keepAliveIntervalSeconds,
+            long[] reconnectDelaysMs) {
         this.identityStore = Objects.requireNonNull(
                 identityStore, "identityStore cannot be null");
         this.trustStore = Objects.requireNonNull(
                 trustStore, "trustStore cannot be null");
+        this.groupStore = Objects.requireNonNull(
+                groupStore, "groupStore cannot be null");
         this.cryptoService = Objects.requireNonNull(
                 cryptoService, "cryptoService cannot be null");
         this.offlineSyncService = new OfflineSyncService(
@@ -144,6 +162,28 @@ public final class ChatClientController implements AutoCloseable {
                 2, new ClientThreadFactory());
         this.scheduler = Executors.newSingleThreadScheduledExecutor(
                 new ClientSchedulerThreadFactory());
+    }
+
+    private static ClientGroupStore createDefaultGroupStore() {
+        try {
+            return new ClientGroupStore();
+        } catch (IOException e) {
+            try {
+                java.nio.file.Path temp = java.nio.file.Files.createTempFile("e2ee-groups", ".json");
+                return new ClientGroupStore(temp);
+            } catch (IOException ex) {
+                throw new IllegalStateException("Khong the khoi tao ClientGroupStore", ex);
+            }
+        }
+    }
+
+    public ClientGroupStore getGroupStore() {
+        return groupStore;
+    }
+
+    public String getMyUsername() {
+        Identity currentIdentity = identity;
+        return currentIdentity != null ? currentIdentity.getUsername() : null;
     }
 
     public void setListener(Listener listener) {
@@ -261,6 +301,123 @@ public final class ChatClientController implements AutoCloseable {
                 dispatchUi(() -> listener.onMessageSentWithTtl(
                         recipientUsername, content, encrypted.getId(),
                         encrypted.getTs(), ttlSeconds));
+            } catch (GeneralSecurityException e) {
+                dispatchError("ENCRYPT_FAILED", e.getMessage());
+            } catch (IOException e) {
+                if (currentChannel == channel) {
+                    connectionLost(currentChannel, e.getMessage());
+                }
+            }
+        });
+    }
+
+    /**
+     * Tạo yêu cầu thành lập nhóm chat mới và gửi lên Server Blind Relay.
+     */
+    public void createGroup(String groupId, String groupName, List<String> memberUsernames) {
+        if (groupId == null || groupId.isBlank()) {
+            dispatchError("INVALID_GROUP_ID", "groupId khong duoc de trong");
+            return;
+        }
+        if (groupName == null || groupName.isBlank()) {
+            dispatchError("INVALID_GROUP_NAME", "groupName khong duoc de trong");
+            return;
+        }
+        if (memberUsernames == null || memberUsernames.isEmpty()) {
+            dispatchError("INVALID_MEMBERS", "Danh sach thanh vien khong duoc rong");
+            return;
+        }
+
+        Identity currentIdentity = identity;
+        PacketChannel currentChannel = channel;
+        if (state != State.CONNECTED || currentIdentity == null || currentChannel == null) {
+            dispatchError("NOT_CONNECTED", "Client chua ket noi");
+            return;
+        }
+
+        ArrayList<String> allMembers = new ArrayList<>(memberUsernames);
+        if (!allMembers.contains(currentIdentity.getUsername())) {
+            allMembers.add(currentIdentity.getUsername());
+        }
+
+        Envelope env = Envelope.createGroup(Opcode.GROUP_CREATE, currentIdentity.getUsername(), groupId)
+                .put("groupId", groupId)
+                .put("groupName", groupName)
+                .put("members", allMembers);
+
+        sendAsync(env);
+    }
+
+    /**
+     * Mã hóa đa người nhận (Multi-recipient key wrap) và gửi tin nhắn nhóm CHAT_GROUP.
+     */
+    public void sendGroupMessage(String groupId, String content) {
+        if (groupId == null || groupId.isBlank()) {
+            dispatchError("INVALID_GROUP_ID", "groupId khong duoc de trong");
+            return;
+        }
+        if (content == null || content.isBlank()) {
+            dispatchError("EMPTY_MESSAGE", "Tin nhan khong duoc de trong");
+            return;
+        }
+        if (!MessageLimits.isWithinLimit(content)) {
+            dispatchError("MESSAGE_TOO_LARGE",
+                    "Tin nhan qua dai (gioi han "
+                    + MessageLimits.MAX_TEXT_UTF8_BYTES + " byte UTF-8)");
+            return;
+        }
+
+        Identity currentIdentity = identity;
+        PacketChannel currentChannel = channel;
+        if (state != State.CONNECTED || currentIdentity == null || currentChannel == null) {
+            dispatchError("NOT_CONNECTED", "Client chua ket noi");
+            return;
+        }
+
+        ClientGroupStore.GroupRecord group = groupStore.getGroup(groupId);
+        if (group == null) {
+            dispatchError("GROUP_NOT_FOUND", "Khong tim thay nhom " + groupId);
+            return;
+        }
+
+        List<String> members = group.members();
+        if (members == null || members.isEmpty()) {
+            dispatchError("INVALID_MEMBERS", "Nhom khong co thanh vien");
+            return;
+        }
+
+        Map<String, PublicKey> memberKeys = new HashMap<>();
+        for (String member : members) {
+            if (isPeerBlocked(member)) {
+                dispatchError("PEER_KEY_CHANGED", "Khoa bao mat cua " + member + " dang bi thay doi");
+                return;
+            }
+            if (member.equals(currentIdentity.getUsername())) {
+                memberKeys.put(member, currentIdentity.getPublicKey());
+            } else {
+                PublicKey key = findPeerKey(member);
+                if (key == null) {
+                    lookupPeer(member);
+                    dispatchError("PEER_KEY_UNAVAILABLE", "Chua co public key cua " + member);
+                    return;
+                }
+                memberKeys.put(member, key);
+            }
+        }
+
+        backgroundExecutor.execute(() -> {
+            try {
+                String membersHash = GroupCryptoService.computeMembersHash(memberKeys);
+                Envelope encrypted = GroupCryptoService.getDefault().createEncryptedGroupMessage(
+                        currentIdentity.getUsername(), groupId, content, memberKeys,
+                        currentIdentity.getPrivateKey(), membersHash);
+                if (currentChannel != channel || !currentChannel.isOpen()) {
+                    dispatchError("NOT_CONNECTED", "Client da mat ket noi");
+                    return;
+                }
+                currentChannel.send(encrypted);
+                dispatchUi(() -> listener.onGroupMessageSent(
+                        groupId, content, encrypted.getId(), encrypted.getTs()));
             } catch (GeneralSecurityException e) {
                 dispatchError("ENCRYPT_FAILED", e.getMessage());
             } catch (IOException e) {
@@ -643,8 +800,27 @@ public final class ChatClientController implements AutoCloseable {
         }
 
         Identity currentIdentity = identity;
-        if (currentIdentity == null
-                || !currentIdentity.getUsername().equals(envelope.getTo())) {
+        if (currentIdentity == null) {
+            dispatchError("INVALID_ENVELOPE", "Client chua dang nhap");
+            return;
+        }
+
+        // Nhánh xử lý quản lý nhóm và tin nhắn nhóm
+        if (envelope.getOp() == Opcode.GROUP_CREATE) {
+            handleIncomingGroupCreate(envelope);
+            return;
+        }
+        if (envelope.getOp() == Opcode.CHAT_GROUP) {
+            if (envelope.getGroupId() == null || envelope.getGroupId().isBlank()) {
+                dispatchError("INVALID_GROUP_MESSAGE", "CHAT_GROUP thieu groupId");
+                return;
+            }
+            handleIncomingChatGroup(envelope);
+            return;
+        }
+
+        // Các gói tin cá nhân khác: bắt buộc to khớp với username hiện tại
+        if (!currentIdentity.getUsername().equals(envelope.getTo())) {
             dispatchError("INVALID_ENVELOPE",
                     "Goi tin khong gui dung nguoi nhan");
             return;
@@ -663,7 +839,7 @@ public final class ChatClientController implements AutoCloseable {
                 }
             }
             default -> {
-                // Các opcode chat, keep-alive và offline được xử lý ở lát cắt sau.
+                // Opcode chua ro bo qua an toan
             }
         }
     }
@@ -859,6 +1035,11 @@ public final class ChatClientController implements AutoCloseable {
             return;
         }
 
+        if (original.getOp() == Opcode.CHAT_GROUP) {
+            handleOfflineGroupSync(syncEnvelope, original, currentIdentity);
+            return;
+        }
+
         String senderUsername = original.getFrom();
         if (original.getOp() != Opcode.CHAT_1TO1
                 || !isValidUsername(senderUsername)
@@ -957,6 +1138,233 @@ public final class ChatClientController implements AutoCloseable {
                 dispatchUi(() -> listener.onSecurityWarning(
                         senderUsername, safeMessage(e.getMessage(),
                                 "Tin nhan offline khong an toan")));
+            }
+        });
+    }
+
+    private void handleIncomingGroupCreate(Envelope envelope) {
+        Identity currentIdentity = identity;
+        if (currentIdentity == null) {
+            dispatchError("INVALID_ENVELOPE", "Client chua dang nhap");
+            return;
+        }
+
+        // Kiểm tra đúng người nhận nếu gói tin có trường 'to'
+        String to = envelope.getTo();
+        if (to != null && !to.isBlank() && !currentIdentity.getUsername().equals(to)) {
+            dispatchError("INVALID_ENVELOPE", "GROUP_CREATE khong gui dung nguoi nhan");
+            return;
+        }
+
+        String groupId = envelope.getGroupId();
+        if (groupId == null || groupId.isBlank()) {
+            groupId = envelope.getString("groupId");
+        }
+        String groupName = envelope.getString("groupName");
+        if (groupName == null || groupName.isBlank()) {
+            groupName = groupId;
+        }
+        String status = envelope.getString("status");
+        Object membersObj = envelope.get("members");
+        List<String> memberList = new ArrayList<>();
+        if (membersObj instanceof Collection<?> col) {
+            for (Object item : col) {
+                if (item != null) {
+                    String m = String.valueOf(item).trim();
+                    if (!m.isEmpty()) {
+                        memberList.add(m);
+                    }
+                }
+            }
+        }
+
+        if (groupId == null || memberList.isEmpty()) {
+            dispatchError("INVALID_GROUP_SNAPSHOT", "GROUP_CREATE thieu thong tin hop le");
+            return;
+        }
+
+        // Bắt buộc client hiện tại phải là thành viên của nhóm
+        if (!memberList.contains(currentIdentity.getUsername())) {
+            dispatchError("NOT_IN_GROUP", "Ban khong thuoc danh sach thanh vien nhom " + groupId);
+            return;
+        }
+
+        try {
+            groupStore.putGroup(groupId, groupName, memberList);
+        } catch (IOException e) {
+            System.err.println("[E2EE-CLIENT] Khong the luu group vao ClientGroupStore: " + e.getMessage());
+        }
+
+        // Tự động tra cứu public key cho các thành viên mới
+        for (String member : memberList) {
+            if (!member.equals(currentIdentity.getUsername())) {
+                if (!peerPublicKeys.containsKey(member) && trustStore.getEntry(member) == null) {
+                    lookupPeer(member);
+                }
+            }
+        }
+
+        final String finalGroupId = groupId;
+        final String finalGroupName = groupName;
+        final List<String> finalMembers = memberList;
+        if ("CREATED".equals(status)) {
+            dispatchUi(() -> listener.onGroupCreated(finalGroupId, finalGroupName, finalMembers));
+        } else {
+            dispatchUi(() -> listener.onGroupSnapshot(finalGroupId, finalGroupName, finalMembers));
+        }
+    }
+
+    private void handleIncomingChatGroup(Envelope envelope) {
+        Identity currentIdentity = identity;
+        String senderUsername = envelope.getFrom();
+        String groupId = envelope.getGroupId();
+        if (currentIdentity == null || !isValidUsername(senderUsername) || groupId == null || groupId.isBlank()) {
+            dispatchError("INVALID_CHAT_GROUP", "CHAT_GROUP khong hop le");
+            return;
+        }
+
+        ClientGroupStore.GroupRecord group = groupStore.getGroup(groupId);
+        if (group == null) {
+            Envelope query = Envelope.createGroup(Opcode.GROUP_CREATE, currentIdentity.getUsername(), groupId)
+                    .put("groupId", groupId);
+            sendAsync(query);
+            return;
+        }
+        if (!group.members().contains(currentIdentity.getUsername())) {
+            dispatchError("NOT_IN_GROUP", "Ban khong phai thanh vien nhom " + groupId);
+            return;
+        }
+
+        if (!group.members().contains(senderUsername)) {
+            dispatchUi(() -> listener.onSecurityWarning(senderUsername,
+                    "Nguoi gui '" + senderUsername + "' khong phai thanh vien nhom " + groupId));
+            return;
+        }
+
+        if (blockedPeers.contains(senderUsername)) {
+            dispatchUi(() -> listener.onSecurityWarning(senderUsername,
+                    "Da chan tin nhan nhom vi public key cua " + senderUsername + " dang bi thay doi"));
+            return;
+        }
+
+        PublicKey senderKey = findPeerKey(senderUsername);
+        if (senderKey == null) {
+            lookupPeer(senderUsername);
+            return;
+        }
+
+        decryptIncomingGroupMessage(envelope, group, senderKey, currentIdentity);
+    }
+
+    private void decryptIncomingGroupMessage(Envelope envelope,
+            ClientGroupStore.GroupRecord group,
+            PublicKey senderKey, Identity currentIdentity) {
+        backgroundExecutor.execute(() -> {
+            try {
+                Map<String, PublicKey> memberKeys = new HashMap<>();
+                for (String member : group.members()) {
+                    if (member.equals(currentIdentity.getUsername())) {
+                        memberKeys.put(member, currentIdentity.getPublicKey());
+                    } else {
+                        PublicKey key = findPeerKey(member);
+                        if (key != null) {
+                            memberKeys.put(member, key);
+                        } else {
+                            lookupPeer(member);
+                        }
+                    }
+                }
+
+                if (memberKeys.size() < group.members().size()) {
+                    dispatchUi(() -> listener.onSecurityWarning(envelope.getFrom(),
+                            "Chua co du public key cua thanh vien nhom de doi soat"));
+                    return;
+                }
+
+                String expectedMembersHash = GroupCryptoService.computeMembersHash(memberKeys);
+                String content = GroupCryptoService.getDefault().verifyAndDecryptGroupMessage(
+                        envelope, currentIdentity.getUsername(), senderKey,
+                        currentIdentity.getPrivateKey(), expectedMembersHash, false);
+
+                if (!MessageLimits.isWithinLimit(content)) {
+                    dispatchUi(() -> listener.onSecurityWarning(
+                            envelope.getFrom(), "Tin nhan nhom vuot qua gioi han kich thuoc"));
+                    return;
+                }
+
+                dispatchUi(() -> listener.onGroupMessageReceived(
+                        envelope.getGroupId(), envelope.getFrom(), content,
+                        envelope.getId(), envelope.getTs()));
+            } catch (GeneralSecurityException | SecurityException | JsonParseException e) {
+                dispatchUi(() -> listener.onSecurityWarning(
+                        envelope.getFrom(), safeMessage(e.getMessage(), "Tin nhan nhom khong an toan")));
+            }
+        });
+    }
+
+    private void handleOfflineGroupSync(Envelope syncEnvelope, Envelope original, Identity currentIdentity) {
+        String groupId = original.getGroupId();
+        String senderUsername = original.getFrom();
+        if (groupId == null || groupId.isBlank() || !isValidUsername(senderUsername)) {
+            dispatchError("INVALID_OFFLINE_SYNC", "Tin nhan nhom offline khong hop le");
+            return;
+        }
+
+        if (GroupCryptoService.getDefault().isMessageSeen(original.getId())) {
+            sendAsync(OfflineSyncService.createAckEnvelope(
+                    currentIdentity.getUsername(), original.getId()));
+            return;
+        }
+
+        ClientGroupStore.GroupRecord group = groupStore.getGroup(groupId);
+        if (group == null || !group.members().contains(currentIdentity.getUsername())) {
+            return;
+        }
+
+        if (blockedPeers.contains(senderUsername)) {
+            dispatchUi(() -> listener.onSecurityWarning(senderUsername,
+                    "Da chan tin offline vi public key dang bi thay doi"));
+            return;
+        }
+
+        PublicKey senderKey = findPeerKey(senderUsername);
+        if (senderKey == null) {
+            lookupPeer(senderUsername);
+            return;
+        }
+
+        backgroundExecutor.execute(() -> {
+            try {
+                Map<String, PublicKey> memberKeys = new HashMap<>();
+                for (String member : group.members()) {
+                    if (member.equals(currentIdentity.getUsername())) {
+                        memberKeys.put(member, currentIdentity.getPublicKey());
+                    } else {
+                        PublicKey key = findPeerKey(member);
+                        if (key != null) {
+                            memberKeys.put(member, key);
+                        } else {
+                            lookupPeer(member);
+                        }
+                    }
+                }
+                if (memberKeys.size() < group.members().size()) {
+                    return;
+                }
+
+                String expectedMembersHash = GroupCryptoService.computeMembersHash(memberKeys);
+                OfflineSyncService.SyncResult result = offlineSyncService.processGroupMessage(
+                        syncEnvelope, currentIdentity.getUsername(), senderKey,
+                        currentIdentity.getPrivateKey(), expectedMembersHash);
+
+                sendAsync(result.getAckEnvelope());
+
+                dispatchUi(() -> listener.onGroupMessageReceived(
+                        groupId, original.getFrom(), result.getDecryptedContent(),
+                        original.getId(), original.getTs()));
+            } catch (GeneralSecurityException | SecurityException | JsonParseException e) {
+                dispatchUi(() -> listener.onSecurityWarning(
+                        original.getFrom(), safeMessage(e.getMessage(), "Loi giai ma tin nhan nhom offline")));
             }
         });
     }
@@ -1298,6 +1706,22 @@ public final class ChatClientController implements AutoCloseable {
 
         default void onPeerTrustRestored(String username,
                 String fingerprint) {
+        }
+
+        default void onGroupCreated(String groupId, String groupName,
+                List<String> members) {
+        }
+
+        default void onGroupSnapshot(String groupId, String groupName,
+                List<String> members) {
+        }
+
+        default void onGroupMessageSent(String groupId, String content,
+                String messageId, long timestamp) {
+        }
+
+        default void onGroupMessageReceived(String groupId, String senderUsername,
+                String content, String messageId, long timestamp) {
         }
     }
 

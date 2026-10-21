@@ -38,6 +38,7 @@ import java.awt.Font;
 import java.awt.FontMetrics;
 import java.awt.Graphics;
 import java.awt.Graphics2D;
+import java.awt.GridLayout;
 import java.awt.Insets;
 import java.awt.Rectangle;
 import java.awt.RenderingHints;
@@ -147,8 +148,20 @@ public final class ChatFrame extends JFrame {
     private final AvatarBadgePanel peerHeaderAvatar =
             new AvatarBadgePanel("", false, 38, null, false);
     private final JLabel conversationTitle = new JLabel("Chọn một người bạn");
+    private final JLabel conversationSubtitle = new JLabel("");
     private final JLabel connectionBanner = new JLabel(
             "Đã kết nối an toàn", SwingConstants.CENTER);
+
+    private enum ConversationTab {
+        ALL,
+        FRIENDS,
+        GROUPS
+    }
+
+    private ConversationTab activeTab = ConversationTab.ALL;
+    private final JButton tabAll = new JButton("Tất cả");
+    private final JButton tabFriends = new JButton("Bạn bè");
+    private final JButton tabGroups = new JButton("Nhóm");
 
     private final Map<String, FriendItem> friends = new HashMap<>();
     private final Map<String, List<ChatMessage>> conversations =
@@ -191,7 +204,7 @@ public final class ChatFrame extends JFrame {
         JSplitPane splitPane = new JSplitPane(
                 JSplitPane.HORIZONTAL_SPLIT,
                 createSidebar(), createConversationPanel());
-        splitPane.setDividerLocation(280);
+        splitPane.setDividerLocation(300);
         splitPane.setDividerSize(1);
         splitPane.setBorder(BorderFactory.createEmptyBorder());
         splitPane.setResizeWeight(0.0);
@@ -210,7 +223,7 @@ public final class ChatFrame extends JFrame {
         sidebar.setBorder(BorderFactory.createCompoundBorder(
                 BorderFactory.createMatteBorder(0, 0, 0, 1, BORDER_COLOR),
                 BorderFactory.createEmptyBorder(14, 14, 14, 14)));
-        sidebar.setPreferredSize(new Dimension(280, 0));
+        sidebar.setPreferredSize(new Dimension(300, 0));
         sidebar.setMinimumSize(new Dimension(220, 0));
 
         // 1. Thẻ hồ sơ của tôi (Profile Card)
@@ -234,7 +247,10 @@ public final class ChatFrame extends JFrame {
         profileCard.add(myAvatar, BorderLayout.WEST);
         profileCard.add(myInfoPanel, BorderLayout.CENTER);
 
-        // 2. Ô tìm kiếm dạng con nhộng với icon kính lúp vector
+        // 2. Ô tìm kiếm và nút "+ Tạo nhóm"
+        JPanel searchAndAddPanel = new JPanel(new BorderLayout(8, 0));
+        searchAndAddPanel.setOpaque(false);
+
         JPanel searchBox = new RoundedPanel(20, BG_WHITE, BORDER_COLOR);
         searchBox.setLayout(new BorderLayout(8, 0));
         searchBox.setBorder(BorderFactory.createEmptyBorder(6, 12, 6, 12));
@@ -247,27 +263,67 @@ public final class ChatFrame extends JFrame {
         addFriendField.setOpaque(false);
         addFriendField.setFont(addFriendField.getFont().deriveFont(Font.PLAIN, 13f));
         addFriendField.setForeground(TEXT_DARK);
-        addFriendField.setToolTipText("Tìm kiếm bạn bè...");
+        addFriendField.setToolTipText("Tìm kiếm...");
         addFriendField.addActionListener(event -> submitFriendLookup());
         searchBox.add(addFriendField, BorderLayout.CENTER);
+        searchAndAddPanel.add(searchBox, BorderLayout.CENTER);
 
-        // 3. Tiêu đề phân mục "Bạn bè"
-        JLabel friendsHeaderLabel = new JLabel("Bạn bè");
-        friendsHeaderLabel.setFont(friendsHeaderLabel.getFont().deriveFont(Font.BOLD, 14f));
-        friendsHeaderLabel.setForeground(TEXT_DARK);
-        friendsHeaderLabel.setBorder(BorderFactory.createEmptyBorder(12, 2, 6, 2));
+        JButton createGroupBtn = new JButton("+ Tạo nhóm") {
+            @Override
+            protected void paintComponent(Graphics g) {
+                Graphics2D g2 = (Graphics2D) g.create();
+                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                g2.setColor(getModel().isRollover() ? new Color(239, 246, 255) : BG_WHITE);
+                g2.fillRoundRect(0, 0, getWidth() - 1, getHeight() - 1, 14, 14);
+                g2.setColor(getModel().isRollover() ? PRIMARY : BORDER_COLOR);
+                g2.drawRoundRect(0, 0, getWidth() - 1, getHeight() - 1, 14, 14);
+                g2.dispose();
+                super.paintComponent(g);
+            }
+        };
+        createGroupBtn.setFont(new Font("Segoe UI", Font.BOLD, 12));
+        createGroupBtn.setForeground(PRIMARY);
+        createGroupBtn.setContentAreaFilled(false);
+        createGroupBtn.setFocusPainted(false);
+        createGroupBtn.setMargin(new Insets(0, 0, 0, 0));
+        createGroupBtn.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        createGroupBtn.setBorder(BorderFactory.createEmptyBorder(6, 8, 6, 8));
+        createGroupBtn.addActionListener(event -> openCreateGroupDialog());
+        searchAndAddPanel.add(createGroupBtn, BorderLayout.EAST);
 
-        // Header trên của Sidebar (Profile Card + Search Box + Tiêu đề Bạn bè)
+        // 3. Thanh tab lọc: Tất cả | Bạn bè | Nhóm
+        JPanel tabBar = new JPanel(new GridLayout(1, 3, 4, 0));
+        tabBar.setOpaque(false);
+        tabBar.setBorder(BorderFactory.createEmptyBorder(4, 0, 4, 0));
+
+        tabAll.setFocusPainted(false);
+        tabAll.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        tabAll.addActionListener(e -> setConversationTab(ConversationTab.ALL));
+
+        tabFriends.setFocusPainted(false);
+        tabFriends.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        tabFriends.addActionListener(e -> setConversationTab(ConversationTab.FRIENDS));
+
+        tabGroups.setFocusPainted(false);
+        tabGroups.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        tabGroups.addActionListener(e -> setConversationTab(ConversationTab.GROUPS));
+
+        updateTabStyles();
+        tabBar.add(tabAll);
+        tabBar.add(tabFriends);
+        tabBar.add(tabGroups);
+
+        // Header trên của Sidebar (Profile Card + Search & Add + Tab Bar)
         JPanel sidebarTop = new JPanel(new BorderLayout(0, 10));
         sidebarTop.setOpaque(false);
         sidebarTop.add(profileCard, BorderLayout.NORTH);
 
-        JPanel searchAndFriends = new JPanel(new BorderLayout(0, 4));
-        searchAndFriends.setOpaque(false);
-        searchAndFriends.add(searchBox, BorderLayout.NORTH);
-        searchAndFriends.add(friendsHeaderLabel, BorderLayout.SOUTH);
+        JPanel searchAndTabs = new JPanel(new BorderLayout(0, 6));
+        searchAndTabs.setOpaque(false);
+        searchAndTabs.add(searchAndAddPanel, BorderLayout.NORTH);
+        searchAndTabs.add(tabBar, BorderLayout.SOUTH);
 
-        sidebarTop.add(searchAndFriends, BorderLayout.CENTER);
+        sidebarTop.add(searchAndTabs, BorderLayout.CENTER);
 
         // 3. Danh sách bạn bè
         friendList.setBackground(BG_SIDEBAR);
@@ -328,8 +384,14 @@ public final class ChatFrame extends JFrame {
                 conversationTitle.getFont().deriveFont(Font.BOLD, 17f));
         conversationTitle.setForeground(TEXT_DARK);
 
+        conversationSubtitle.setFont(new Font("Segoe UI", Font.PLAIN, 12));
+        conversationSubtitle.setForeground(TEXT_MUTED);
+        conversationSubtitle.setVisible(false);
+
         textInfoPanel.add(javax.swing.Box.createVerticalGlue());
         textInfoPanel.add(conversationTitle);
+        textInfoPanel.add(javax.swing.Box.createVerticalStrut(2));
+        textInfoPanel.add(conversationSubtitle);
         textInfoPanel.add(javax.swing.Box.createVerticalGlue());
 
         headerLeft.add(textInfoPanel, BorderLayout.CENTER);
@@ -513,7 +575,12 @@ public final class ChatFrame extends JFrame {
         }
         TtlOption option = (TtlOption) ttlSelector.getSelectedItem();
         int ttlSeconds = option != null ? option.seconds : 0;
-        actions.onSendMessage(selectedPeer, content, ttlSeconds);
+        FriendItem item = friends.get(selectedPeer);
+        if (item != null && item.isGroup()) {
+            actions.onSendGroupMessage(selectedPeer, content, ttlSeconds);
+        } else {
+            actions.onSendMessage(selectedPeer, content, ttlSeconds);
+        }
         messageInput.setText("");
     }
 
@@ -586,6 +653,57 @@ public final class ChatFrame extends JFrame {
         friendList.repaint();
     }
 
+    public void addGroup(String groupId, String groupName, List<String> members) {
+        requireEdt();
+        if (friends.containsKey(groupId)) {
+            return;
+        }
+        FriendItem group = new FriendItem(groupId, groupName, true, true, members);
+        friends.put(groupId, group);
+        friendModel.addElement(group);
+        sendAllowed.put(groupId, true);
+        applyFriendFilter();
+    }
+
+    public void addGroupMessage(String groupId, String senderUsername, String content,
+                                long timestamp, boolean sentByMe, int ttlSeconds) {
+        if (ttlSeconds < 0 || ttlSeconds > 86_400) {
+            throw new IllegalArgumentException("TTL khong hop le");
+        }
+        long expiresAt = ttlSeconds == 0 ? 0L : timestamp + ttlSeconds * 1_000L;
+        requireEdt();
+        if (expiresAt > 0 && expiresAt <= System.currentTimeMillis()) {
+            return;
+        }
+        conversations.computeIfAbsent(groupId, ignored -> new ArrayList<>())
+                .add(new ChatMessage(senderUsername, content, timestamp, sentByMe, expiresAt));
+        if (groupId.equals(selectedPeer)) {
+            renderSelectedConversation();
+        }
+        friendList.repaint();
+    }
+
+    private void openCreateGroupDialog() {
+        List<FriendItem> availableFriends = new ArrayList<>();
+        for (int i = 0; i < friendModel.size(); i++) {
+            FriendItem item = friendModel.get(i);
+            if (!item.isGroup()) {
+                availableFriends.add(item);
+            }
+        }
+        CreateGroupDialog dialog = new CreateGroupDialog(this, availableFriends,
+                (groupName, memberUsernames) -> {
+                    String groupId = "group_" + java.util.UUID.randomUUID().toString();
+                    List<String> allMembers = new ArrayList<>(memberUsernames);
+                    if (!allMembers.contains(myUsername)) {
+                        allMembers.add(myUsername);
+                    }
+                    showBanner("Đang gửi yêu cầu tạo nhóm '" + groupName + "'...", BannerType.WARNING);
+                    actions.onCreateGroup(groupId, groupName, allMembers);
+                });
+        dialog.setVisible(true);
+    }
+
     public void setPeerSendAllowed(String username, boolean allowed) {
         requireEdt();
         sendAllowed.put(username, allowed);
@@ -643,22 +761,49 @@ public final class ChatFrame extends JFrame {
         messagesPanel.removeAll();
         if (selectedPeer == null) {
             peerHeaderAvatar.setVisible(false);
-            conversationTitle.setText("Chọn một người bạn");
+            conversationTitle.setText("Chọn một cuộc trò chuyện");
+            conversationSubtitle.setVisible(false);
         } else {
-            FriendItem friend = friends.get(selectedPeer);
-            boolean isOnline = friend != null && friend.isOnline();
-            peerHeaderAvatar.update(selectedPeer, isOnline);
-            peerHeaderAvatar.setVisible(true);
-            conversationTitle.setText(selectedPeer);
+            FriendItem item = friends.get(selectedPeer);
+            boolean isGroup = item != null && item.isGroup();
+            if (isGroup) {
+                peerHeaderAvatar.updateGroup(item.getDisplayName());
+                peerHeaderAvatar.setVisible(true);
+                conversationTitle.setText(item.getDisplayName());
+
+                int memberCount = item.getMembers().size();
+                int onlineCount = 0;
+                for (String m : item.getMembers()) {
+                    FriendItem f = friends.get(m);
+                    if (f != null && f.isOnline()) {
+                        onlineCount++;
+                    }
+                }
+                if (onlineCount == 0 && memberCount > 0) {
+                    onlineCount = 1;
+                }
+                conversationSubtitle.setText(memberCount + " thành viên • " + onlineCount + " trực tuyến");
+                conversationSubtitle.setVisible(true);
+            } else {
+                boolean isOnline = item != null && item.isOnline();
+                peerHeaderAvatar.update(selectedPeer, isOnline);
+                peerHeaderAvatar.setVisible(true);
+                conversationTitle.setText(selectedPeer);
+                conversationSubtitle.setText(isOnline ? "Trực tuyến" : "Ngoại tuyến");
+                conversationSubtitle.setVisible(true);
+            }
+
             for (ChatMessage message : conversations.getOrDefault(
                     selectedPeer, List.of())) {
+                String senderDisplay = message.sender() != null ? message.sender() : selectedPeer;
                 messagesPanel.add(new MessageRowPanel(
-                        selectedPeer,
+                        senderDisplay,
                         message.content(),
                         message.timestamp,
                         message.sentByMe,
                         remainingSeconds(message,
-                                System.currentTimeMillis())));
+                                System.currentTimeMillis()),
+                        isGroup));
                 messagesPanel.add(javax.swing.Box.createVerticalStrut(12));
             }
         }
@@ -673,15 +818,22 @@ public final class ChatFrame extends JFrame {
 
     private void updateComposerState() {
         boolean hasPeer = selectedPeer != null;
+        FriendItem item = hasPeer ? friends.get(selectedPeer) : null;
+        boolean isGroup = item != null && item.isGroup();
         boolean allowed = hasPeer
                 && sendAllowed.getOrDefault(selectedPeer, false);
         messageInput.setEnabled(allowed);
         sendButton.setEnabled(allowed);
         sendButton.setBackground(allowed ? PRIMARY : new Color(226, 232, 240));
         sendButton.setForeground(allowed ? Color.WHITE : new Color(148, 163, 184));
-        securityButton.setEnabled(hasPeer);
-        securityButton.setVisible(hasPeer);
-        ttlSelector.setEnabled(allowed);
+        securityButton.setEnabled(hasPeer && !isGroup);
+        securityButton.setVisible(hasPeer && !isGroup);
+        if (isGroup) {
+            ttlSelector.setEnabled(false);
+            ttlSelector.setSelectedIndex(0);
+        } else {
+            ttlSelector.setEnabled(allowed);
+        }
     }
 
     private void expireMessages(long now) {
@@ -754,7 +906,14 @@ public final class ChatFrame extends JFrame {
             displayedFriendModel.clear();
             for (int i = 0; i < friendModel.size(); i++) {
                 FriendItem item = friendModel.get(i);
+                if (activeTab == ConversationTab.FRIENDS && item.isGroup()) {
+                    continue;
+                }
+                if (activeTab == ConversationTab.GROUPS && !item.isGroup()) {
+                    continue;
+                }
                 if (query.isEmpty()
+                        || removeAccents(item.getDisplayName()).toLowerCase(Locale.ROOT).contains(query)
                         || removeAccents(item.getUsername()).toLowerCase(Locale.ROOT).contains(query)) {
                     displayedFriendModel.addElement(item);
                 }
@@ -768,6 +927,28 @@ public final class ChatFrame extends JFrame {
         } finally {
             filteringFriends = false;
         }
+    }
+
+    private void setConversationTab(ConversationTab tab) {
+        this.activeTab = tab;
+        updateTabStyles();
+        applyFriendFilter();
+    }
+
+    private void updateTabStyles() {
+        styleTabButton(tabAll, activeTab == ConversationTab.ALL);
+        styleTabButton(tabFriends, activeTab == ConversationTab.FRIENDS);
+        styleTabButton(tabGroups, activeTab == ConversationTab.GROUPS);
+    }
+
+    private void styleTabButton(JButton btn, boolean active) {
+        btn.setFont(new Font("Segoe UI", active ? Font.BOLD : Font.PLAIN, 12));
+        btn.setForeground(active ? PRIMARY : TEXT_MUTED);
+        btn.setBackground(active ? new Color(239, 246, 255) : BG_WHITE);
+        btn.setContentAreaFilled(true);
+        btn.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(active ? PRIMARY : BORDER_COLOR, 1, true),
+                BorderFactory.createEmptyBorder(5, 8, 5, 8)));
     }
 
     static String removeAccents(String text) {
@@ -860,35 +1041,74 @@ public final class ChatFrame extends JFrame {
             onSendMessage(username, content);
         }
 
+        default void onSendGroupMessage(String groupId, String content) {
+        }
+
+        default void onSendGroupMessage(String groupId, String content,
+                int ttlSeconds) {
+            onSendGroupMessage(groupId, content);
+        }
+
         void onOpenSecurity(String username);
 
         void onClose();
+
+        default void onCreateGroup(String groupName, List<String> memberUsernames) {
+        }
+
+        default void onCreateGroup(String groupId, String groupName, List<String> memberUsernames) {
+            onCreateGroup(groupName, memberUsernames);
+        }
     }
 
     public static final class FriendItem {
         private final String username;
+        private final String displayName;
         private boolean online;
+        private final boolean group;
+        private final List<String> members;
 
-        private FriendItem(String username, boolean online) {
-            this.username = username;
+        public FriendItem(String username, boolean online) {
+            this(username, username, online, false, List.of());
+        }
+
+        public FriendItem(String groupId, String displayName, boolean online,
+                          boolean group, List<String> members) {
+            this.username = Objects.requireNonNull(groupId, "username cannot be null");
+            this.displayName = displayName != null ? displayName : groupId;
             this.online = online;
+            this.group = group;
+            this.members = members != null ? new ArrayList<>(members) : new ArrayList<>();
         }
 
         public String getUsername() {
             return username;
         }
 
+        public String getDisplayName() {
+            return displayName;
+        }
+
         public boolean isOnline() {
             return online;
         }
 
+        public boolean isGroup() {
+            return group;
+        }
+
+        public List<String> getMembers() {
+            return List.copyOf(members);
+        }
+
         @Override
         public String toString() {
-            return username;
+            return displayName != null ? displayName : username;
         }
     }
 
     private static final class ChatMessage {
+        private final String sender;
         private final byte[] contentBytes;
         private final long timestamp;
         private final boolean sentByMe;
@@ -896,11 +1116,21 @@ public final class ChatFrame extends JFrame {
 
         private ChatMessage(String content, long timestamp,
                 boolean sentByMe, long expiresAt) {
+            this(null, content, timestamp, sentByMe, expiresAt);
+        }
+
+        private ChatMessage(String sender, String content, long timestamp,
+                boolean sentByMe, long expiresAt) {
+            this.sender = sender;
             this.contentBytes = (content == null ? "" : content)
                     .getBytes(StandardCharsets.UTF_8);
             this.timestamp = timestamp;
             this.sentByMe = sentByMe;
             this.expiresAt = expiresAt;
+        }
+
+        private String sender() {
+            return sender;
         }
 
         private String content() {
@@ -937,6 +1167,8 @@ public final class ChatFrame extends JFrame {
         private final Color customBgColor;
         private final boolean showStatusDot;
 
+        private boolean isGroup;
+
         private AvatarBadgePanel(String username, boolean online, int size) {
             this(username, online, size, null, true);
         }
@@ -957,9 +1189,17 @@ public final class ChatFrame extends JFrame {
             setOpaque(false);
         }
 
+        private void updateGroup(String groupName) {
+            this.username = groupName != null ? groupName : "";
+            this.online = true;
+            this.isGroup = true;
+            repaint();
+        }
+
         private void update(String username, boolean online) {
             this.username = username != null ? username : "";
             this.online = online;
+            this.isGroup = false;
             repaint();
         }
 
@@ -972,6 +1212,21 @@ public final class ChatFrame extends JFrame {
             Graphics2D g2 = (Graphics2D) g.create();
             g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING,
                     RenderingHints.VALUE_ANTIALIAS_ON);
+
+            if (isGroup) {
+                g2.setColor(PRIMARY);
+                g2.fillRoundRect(0, 0, size, size, 12, 12);
+                g2.setColor(Color.WHITE);
+                g2.setStroke(new BasicStroke(1.6f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+                int ox = (size - 18) / 2;
+                int oy = (size - 18) / 2;
+                g2.drawOval(ox + 3, oy + 2, 7, 7);
+                g2.drawArc(ox + 0, oy + 10, 13, 9, 0, 180);
+                g2.drawOval(ox + 10, oy + 3, 5, 5);
+                g2.drawArc(ox + 8, oy + 10, 9, 7, 0, 160);
+                g2.dispose();
+                return;
+            }
 
             // Vòng tròn avatar với màu nền cố định hoặc theo hash username
             Color bgColor = customBgColor;
@@ -993,10 +1248,12 @@ public final class ChatFrame extends JFrame {
             g2.setColor(bgColor);
             g2.fillOval(0, 0, size, size);
 
-            // Chữ cái đầu viết hoa
-            String initial = String.valueOf(Character.toUpperCase(username.charAt(0)));
+            // 2 chữ cái đầu viết hoa nếu có
+            String initial = username.length() >= 2
+                    ? username.substring(0, 2).toUpperCase()
+                    : username.substring(0, 1).toUpperCase();
             g2.setColor(Color.WHITE);
-            g2.setFont(new Font("Segoe UI", Font.BOLD, (int) (size * 0.45)));
+            g2.setFont(new Font("Segoe UI", Font.BOLD, (int) (size * 0.40)));
             FontMetrics fm = g2.getFontMetrics();
             int tx = (size - fm.stringWidth(initial)) / 2;
             int ty = (size - fm.getHeight()) / 2 + fm.getAscent();
@@ -1209,13 +1466,17 @@ public final class ChatFrame extends JFrame {
 
             if (value instanceof FriendItem friend) {
                 AvatarBadgePanel avatar = new AvatarBadgePanel(
-                        friend.getUsername(), friend.isOnline(), 38);
+                        friend.isGroup() ? friend.getDisplayName() : friend.getUsername(),
+                        friend.isOnline(), 38, null, !friend.isGroup());
+                if (friend.isGroup()) {
+                    avatar.updateGroup(friend.getDisplayName());
+                }
 
                 JPanel textPanel = new JPanel();
                 textPanel.setOpaque(false);
                 textPanel.setLayout(new BoxLayout(textPanel, BoxLayout.Y_AXIS));
 
-                JLabel nameLabel = new JLabel(friend.getUsername());
+                JLabel nameLabel = new JLabel(friend.getDisplayName());
                 nameLabel.setFont(new Font("Segoe UI", Font.BOLD, 14));
                 nameLabel.setForeground(selected ? Color.WHITE : TEXT_DARK);
 
@@ -1225,6 +1486,9 @@ public final class ChatFrame extends JFrame {
                 int maxTextWidth = listWidth > 0 ? listWidth - 78 : 170;
 
                 String rawPreview = getLastMessagePreview(friend.getUsername());
+                if (rawPreview.isEmpty() && friend.isGroup()) {
+                    rawPreview = friend.getMembers().size() + " thành viên";
+                }
                 String displayPreview = formatMessagePreview(rawPreview, fm, maxTextWidth);
 
                 JLabel previewLabel = new JLabel(displayPreview);
@@ -1250,6 +1514,11 @@ public final class ChatFrame extends JFrame {
     private static final class MessageRowPanel extends JPanel {
         private MessageRowPanel(String peerUsername, String content,
                 long timestamp, boolean sentByMe, int remainingSeconds) {
+            this(peerUsername, content, timestamp, sentByMe, remainingSeconds, false);
+        }
+
+        private MessageRowPanel(String senderUsername, String content,
+                long timestamp, boolean sentByMe, int remainingSeconds, boolean isGroup) {
             super(new BorderLayout());
             setOpaque(false);
 
@@ -1279,7 +1548,19 @@ public final class ChatFrame extends JFrame {
                 JPanel leftContainer = new JPanel(new BorderLayout(8, 0));
                 leftContainer.setOpaque(false);
 
-                AvatarBadgePanel avatar = new AvatarBadgePanel(peerUsername, false, 30, null, false);
+                AvatarBadgePanel avatar = new AvatarBadgePanel(senderUsername, false, 30, null, false);
+
+                JPanel bubbleWrapper = new JPanel();
+                bubbleWrapper.setLayout(new BoxLayout(bubbleWrapper, BoxLayout.Y_AXIS));
+                bubbleWrapper.setOpaque(false);
+
+                if (isGroup) {
+                    JLabel senderLabel = new JLabel(senderUsername);
+                    senderLabel.setFont(new Font("Segoe UI", Font.BOLD, 12));
+                    senderLabel.setForeground(new Color(51, 65, 85));
+                    senderLabel.setBorder(BorderFactory.createEmptyBorder(0, 4, 3, 0));
+                    bubbleWrapper.add(senderLabel);
+                }
 
                 JTextArea msgText = createTextArea(content, TEXT_DARK);
                 msgText.setAlignmentX(Component.LEFT_ALIGNMENT);
@@ -1295,9 +1576,10 @@ public final class ChatFrame extends JFrame {
                 BubblePanel bubble = new BubblePanel(
                         18, new Color(241, 245, 249), BORDER_COLOR,
                         msgText, metaLabel, content, true);
+                bubbleWrapper.add(bubble);
 
                 leftContainer.add(avatar, BorderLayout.WEST);
-                leftContainer.add(bubble, BorderLayout.CENTER);
+                leftContainer.add(bubbleWrapper, BorderLayout.CENTER);
 
                 add(leftContainer, BorderLayout.WEST);
             }

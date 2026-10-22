@@ -709,6 +709,11 @@ public final class ChatFrame extends JFrame {
             throw new IllegalArgumentException("TTL khong hop le");
         }
         long expiresAt = ttlSeconds == 0 ? 0L : timestamp + ttlSeconds * 1_000L;
+        addGroupMessageWithExpiry(groupId, senderUsername, content, timestamp, sentByMe, expiresAt);
+    }
+
+    public void addGroupMessageWithExpiry(String groupId, String senderUsername, String content,
+                                          long timestamp, boolean sentByMe, long expiresAt) {
         requireEdt();
         if (expiresAt > 0 && expiresAt <= System.currentTimeMillis()) {
             return;
@@ -881,12 +886,7 @@ public final class ChatFrame extends JFrame {
         securityButton.setVisible(hasPeer && !isGroup);
         groupInfoButton.setEnabled(hasPeer && isGroup);
         groupInfoButton.setVisible(hasPeer && isGroup);
-        if (isGroup) {
-            ttlSelector.setEnabled(false);
-            ttlSelector.setSelectedIndex(0);
-        } else {
-            ttlSelector.setEnabled(allowed);
-        }
+        ttlSelector.setEnabled(allowed);
     }
 
     private void expireMessages(long now) {

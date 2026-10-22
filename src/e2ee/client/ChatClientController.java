@@ -385,9 +385,17 @@ public final class ChatClientController implements AutoCloseable {
     }
 
     /**
-     * Mã hóa đa người nhận (Multi-recipient key wrap) và gửi tin nhắn nhóm CHAT_GROUP.
+    /**
+     * Mã hóa đa người nhận (Multi-recipient key wrap) và gửi tin nhắn nhóm CHAT_GROUP không tự hủy (TTL = 0).
      */
     public void sendGroupMessage(String groupId, String content) {
+        sendGroupMessage(groupId, content, 0);
+    }
+
+    /**
+     * Mã hóa đa người nhận (Multi-recipient key wrap) và gửi tin nhắn nhóm CHAT_GROUP với TTL tự hủy.
+     */
+    public void sendGroupMessage(String groupId, String content, int ttlSeconds) {
         if (groupId == null || groupId.isBlank()) {
             dispatchError("INVALID_GROUP_ID", "groupId khong duoc de trong");
             return;
@@ -400,6 +408,10 @@ public final class ChatClientController implements AutoCloseable {
             dispatchError("MESSAGE_TOO_LARGE",
                     "Tin nhan qua dai (gioi han "
                     + MessageLimits.MAX_TEXT_UTF8_BYTES + " byte UTF-8)");
+            return;
+        }
+        if (ttlSeconds < 0 || ttlSeconds > 86_400) {
+            dispatchError("INVALID_TTL", "TTL khong hop le");
             return;
         }
 
@@ -446,14 +458,14 @@ public final class ChatClientController implements AutoCloseable {
                 String membersHash = GroupCryptoService.computeMembersHash(memberKeys);
                 Envelope encrypted = GroupCryptoService.getDefault().createEncryptedGroupMessage(
                         currentIdentity.getUsername(), groupId, content, memberKeys,
-                        currentIdentity.getPrivateKey(), membersHash);
+                        currentIdentity.getPrivateKey(), membersHash, ttlSeconds);
                 if (currentChannel != channel || !currentChannel.isOpen()) {
                     dispatchError("NOT_CONNECTED", "Client da mat ket noi");
                     return;
                 }
                 currentChannel.send(encrypted);
                 dispatchUi(() -> listener.onGroupMessageSent(
-                        groupId, content, encrypted.getId(), encrypted.getTs()));
+                        groupId, content, encrypted.getId(), encrypted.getTs(), ttlSeconds));
             } catch (GeneralSecurityException e) {
                 dispatchError("ENCRYPT_FAILED", e.getMessage());
             } catch (IOException e) {
@@ -1318,19 +1330,21 @@ public final class ChatClientController implements AutoCloseable {
                 }
 
                 String expectedMembersHash = GroupCryptoService.computeMembersHash(memberKeys);
-                String content = GroupCryptoService.getDefault().verifyAndDecryptGroupMessage(
+                GroupCryptoService.DecryptedGroupMessage decrypted = GroupCryptoService.getDefault().verifyAndDecryptGroup(
                         envelope, currentIdentity.getUsername(), senderKey,
                         currentIdentity.getPrivateKey(), expectedMembersHash, false);
 
-                if (!MessageLimits.isWithinLimit(content)) {
+                if (!MessageLimits.isWithinLimit(decrypted.getContent())) {
                     dispatchUi(() -> listener.onSecurityWarning(
                             envelope.getFrom(), "Tin nhan nhom vuot qua gioi han kich thuoc"));
                     return;
                 }
 
-                dispatchUi(() -> listener.onGroupMessageReceived(
-                        envelope.getGroupId(), envelope.getFrom(), content,
-                        envelope.getId(), envelope.getTs()));
+                if (!decrypted.isExpired()) {
+                    dispatchUi(() -> listener.onGroupMessageReceived(
+                            envelope.getGroupId(), envelope.getFrom(), decrypted.getContent(),
+                            envelope.getId(), envelope.getTs(), decrypted.getExpiresAt()));
+                }
             } catch (GeneralSecurityException | SecurityException | JsonParseException e) {
                 dispatchUi(() -> listener.onSecurityWarning(
                         envelope.getFrom(), safeMessage(e.getMessage(), "Tin nhan nhom khong an toan")));
@@ -1395,9 +1409,11 @@ public final class ChatClientController implements AutoCloseable {
 
                 sendAsync(result.getAckEnvelope());
 
-                dispatchUi(() -> listener.onGroupMessageReceived(
-                        groupId, original.getFrom(), result.getDecryptedContent(),
-                        original.getId(), original.getTs()));
+                if (!result.isExpired()) {
+                    dispatchUi(() -> listener.onGroupMessageReceived(
+                            groupId, original.getFrom(), result.getDecryptedContent(),
+                            original.getId(), original.getTs(), result.getExpiresAt()));
+                }
             } catch (GeneralSecurityException | SecurityException | JsonParseException e) {
                 dispatchUi(() -> listener.onSecurityWarning(
                         original.getFrom(), safeMessage(e.getMessage(), "Loi giai ma tin nhan nhom offline")));
@@ -1756,8 +1772,18 @@ public final class ChatClientController implements AutoCloseable {
                 String messageId, long timestamp) {
         }
 
+        default void onGroupMessageSent(String groupId, String content,
+                String messageId, long timestamp, int ttlSeconds) {
+            onGroupMessageSent(groupId, content, messageId, timestamp);
+        }
+
         default void onGroupMessageReceived(String groupId, String senderUsername,
                 String content, String messageId, long timestamp) {
+        }
+
+        default void onGroupMessageReceived(String groupId, String senderUsername,
+                String content, String messageId, long timestamp, long expiresAt) {
+            onGroupMessageReceived(groupId, senderUsername, content, messageId, timestamp);
         }
     }
 

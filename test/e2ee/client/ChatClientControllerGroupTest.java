@@ -46,6 +46,10 @@ public final class ChatClientControllerGroupTest {
                 ChatClientControllerGroupTest::testGhostMemberDetection);
         TestSupport.check("CCCG-6 - Chay thu offline sync tin nhan nhom va gui ACK",
                 ChatClientControllerGroupTest::testOfflineGroupSyncAndAck);
+        TestSupport.check("CCCG-7 - Gui va nhan tin nhan nhom co TTL",
+                ChatClientControllerGroupTest::testSendGroupMessageWithTtl);
+        TestSupport.check("CCCG-8 - Tin nhan nhom offline qua han van gui ACK va khong hien thi UI",
+                ChatClientControllerGroupTest::testExpiredOfflineGroupSyncSendsAckWithoutUi);
 
         TestSupport.summary();
     }
@@ -265,6 +269,94 @@ public final class ChatClientControllerGroupTest {
         }
     }
 
+    private static void testSendGroupMessageWithTtl() throws Exception {
+        TestContext context = TestContext.create();
+        Session session = context.openSession();
+        try {
+            KeyPair bob = ClientCryptoEngine.generateRsaKeyPair();
+            context.trustStore.checkPeerKey("bob", encodePublicKey(bob));
+
+            List<String> members = Arrays.asList("alice", "bob");
+            session.controller.getGroupStore().putGroup("g-ttl", "Nhom TTL", members);
+
+            session.controller.sendGroupMessage("g-ttl", "Tin nhan nhom tu huy", 10);
+
+            // Server nhan Envelope CHAT_GROUP
+            Envelope chatGroup = session.server.serverChannel.receive();
+            TestSupport.assertEquals(Opcode.CHAT_GROUP, chatGroup.getOp());
+            TestSupport.assertEquals("g-ttl", chatGroup.getGroupId());
+            TestSupport.assertEquals("alice", chatGroup.getFrom());
+
+            // Alice listener nhan callback onGroupMessageSent kem ttlSeconds = 10
+            session.listener.awaitGroupSent();
+            TestSupport.assertEquals(Integer.valueOf(10), session.listener.sentTtl.get());
+
+            // Bob giai ma phai doc duoc ttl = 10 va expires_at > now
+            Map<String, PublicKey> roster = new HashMap<>();
+            roster.put("alice", session.server.alicePublicKey.get());
+            roster.put("bob", bob.getPublic());
+            String expectedHash = GroupCryptoService.computeMembersHash(roster);
+
+            GroupCryptoService bobCrypto = new GroupCryptoService();
+            GroupCryptoService.DecryptedGroupMessage dec = bobCrypto.verifyAndDecryptGroup(
+                    chatGroup, "bob", session.server.alicePublicKey.get(), bob.getPrivate(), expectedHash, false);
+
+            TestSupport.assertEquals("Tin nhan nhom tu huy", dec.getContent());
+            TestSupport.assertEquals(10, dec.getTtlSeconds());
+            TestSupport.assertTrue(dec.getExpiresAt() > System.currentTimeMillis(), "expiresAt phai trong tuong lai");
+            TestSupport.assertFalse(dec.isExpired(), "Tin nhan chua duoc het han ngay");
+        } finally {
+            session.close();
+            context.delete();
+        }
+    }
+
+    private static void testExpiredOfflineGroupSyncSendsAckWithoutUi() throws Exception {
+        TestContext context = TestContext.create();
+        Session session = context.openSession();
+        try {
+            KeyPair bob = ClientCryptoEngine.generateRsaKeyPair();
+            context.trustStore.checkPeerKey("bob", encodePublicKey(bob));
+
+            List<String> members = Arrays.asList("alice", "bob");
+            session.controller.getGroupStore().putGroup("g-exp", "Nhom Offline Expired", members);
+
+            Map<String, PublicKey> roster = new HashMap<>();
+            roster.put("alice", session.server.alicePublicKey.get());
+            roster.put("bob", bob.getPublic());
+            String membersHash = GroupCryptoService.computeMembersHash(roster);
+
+            Map<String, PublicKey> recipients = new HashMap<>();
+            recipients.put("alice", session.server.alicePublicKey.get());
+
+            // Bob tao tin nhan voi TTL = 1s, nhung gia lap delay 1.5s de chac chan qua han
+            GroupCryptoService bobCrypto = new GroupCryptoService();
+            Envelope originalMsg = bobCrypto.createEncryptedGroupMessage(
+                    "bob", "g-exp", "Tin nhan nhom da het han", recipients, bob.getPrivate(), membersHash, 1);
+            Thread.sleep(1200);
+
+            Envelope sync = Envelope.create(Opcode.OFFLINE_SYNC, "server", "alice")
+                    .put("original_envelope", EnvelopeMapper.toMap(originalMsg));
+
+            session.server.serverChannel.send(sync);
+
+            // 1. Server BAT BUOC phai nhan duoc ACK tu Alice de khong bi loop
+            Envelope ack = session.server.serverChannel.receive();
+            TestSupport.assertEquals(Opcode.ACK, ack.getOp());
+            TestSupport.assertEquals("alice", ack.getFrom());
+            TestSupport.assertEquals("server", ack.getTo());
+            TestSupport.assertEquals(originalMsg.getId(), ack.getString("ack_msg_id"));
+            TestSupport.assertEquals("DELIVERED", ack.getString("status"));
+
+            // 2. Alice listener KHONG duoc phep nhan duoc callback groupReceived (vi tin da qua han)
+            boolean receivedOnUi = session.listener.groupReceived.await(500, TimeUnit.MILLISECONDS);
+            TestSupport.assertFalse(receivedOnUi, "Tin nhan qua han khong duoc hien thi len UI!");
+        } finally {
+            session.close();
+            context.delete();
+        }
+    }
+
     private static String encodePublicKey(KeyPair keyPair) {
         return Base64.getEncoder().encodeToString(keyPair.getPublic().getEncoded());
     }
@@ -288,6 +380,9 @@ public final class ChatClientControllerGroupTest {
         private final AtomicReference<String> receivedGroupSender = new AtomicReference<>();
         private final AtomicReference<String> receivedGroupContent = new AtomicReference<>();
 
+        private final AtomicReference<Integer> sentTtl = new AtomicReference<>(0);
+        private final AtomicReference<Long> receivedExpiresAt = new AtomicReference<>(0L);
+
         @Override
         public void onAuthenticated(String username) {
             authenticated.countDown();
@@ -307,14 +402,26 @@ public final class ChatClientControllerGroupTest {
 
         @Override
         public void onGroupMessageSent(String groupId, String content, String messageId, long timestamp) {
+            onGroupMessageSent(groupId, content, messageId, timestamp, 0);
+        }
+
+        @Override
+        public void onGroupMessageSent(String groupId, String content, String messageId, long timestamp, int ttlSeconds) {
+            sentTtl.set(ttlSeconds);
             groupSent.countDown();
         }
 
         @Override
         public void onGroupMessageReceived(String groupId, String senderUsername, String content, String messageId, long timestamp) {
+            onGroupMessageReceived(groupId, senderUsername, content, messageId, timestamp, 0L);
+        }
+
+        @Override
+        public void onGroupMessageReceived(String groupId, String senderUsername, String content, String messageId, long timestamp, long expiresAt) {
             receivedGroupId.set(groupId);
             receivedGroupSender.set(senderUsername);
             receivedGroupContent.set(content);
+            receivedExpiresAt.set(expiresAt);
             groupReceived.countDown();
         }
 

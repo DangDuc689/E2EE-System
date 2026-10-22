@@ -110,7 +110,7 @@ public class ClientMain {
 
         @Override
         public void onSendGroupMessage(String groupId, String content, int ttlSeconds) {
-            controller.sendGroupMessage(groupId, content);
+            controller.sendGroupMessage(groupId, content, ttlSeconds);
         }
 
         @Override
@@ -318,18 +318,30 @@ public class ClientMain {
         @Override
         public void onGroupMessageSent(String groupId, String content,
                 String messageId, long timestamp) {
+            onGroupMessageSent(groupId, content, messageId, timestamp, 0);
+        }
+
+        @Override
+        public void onGroupMessageSent(String groupId, String content,
+                String messageId, long timestamp, int ttlSeconds) {
             if (chatFrame != null) {
                 chatFrame.addGroupMessage(groupId, controller.getMyUsername(),
-                        content, timestamp, true, 0);
+                        content, timestamp, true, ttlSeconds);
             }
         }
 
         @Override
         public void onGroupMessageReceived(String groupId, String senderUsername,
                 String content, String messageId, long timestamp) {
+            onGroupMessageReceived(groupId, senderUsername, content, messageId, timestamp, 0L);
+        }
+
+        @Override
+        public void onGroupMessageReceived(String groupId, String senderUsername,
+                String content, String messageId, long timestamp, long expiresAt) {
             if (chatFrame != null) {
-                chatFrame.addGroupMessage(groupId, senderUsername,
-                        content, timestamp, false, 0);
+                chatFrame.addGroupMessageWithExpiry(groupId, senderUsername,
+                        content, timestamp, false, expiresAt);
             }
         }
 

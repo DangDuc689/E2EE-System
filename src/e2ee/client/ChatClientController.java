@@ -204,6 +204,42 @@ public final class ChatClientController implements AutoCloseable {
         return trustStore;
     }
 
+    public enum MemberTrustState {
+        VERIFIED("Đã đối soát"),
+        TRUSTED_TOFU("Chưa đối soát"),
+        KEY_CHANGED("Cảnh báo đổi khóa!"),
+        MYSELF("Bạn"),
+        UNKNOWN("Chưa có khóa");
+
+        private final String label;
+
+        MemberTrustState(String label) {
+            this.label = label;
+        }
+
+        public String getLabel() {
+            return label;
+        }
+    }
+
+    public MemberTrustState getMemberTrustState(String username) {
+        if (username == null) {
+            return MemberTrustState.UNKNOWN;
+        }
+        Identity current = identity;
+        if (current != null && username.equals(current.getUsername())) {
+            return MemberTrustState.MYSELF;
+        }
+        if (pendingChangedKeys.containsKey(username)) {
+            return MemberTrustState.KEY_CHANGED;
+        }
+        LocalTrustStore.Entry entry = trustStore.getEntry(username);
+        if (entry != null) {
+            return entry.isVerified() ? MemberTrustState.VERIFIED : MemberTrustState.TRUSTED_TOFU;
+        }
+        return MemberTrustState.UNKNOWN;
+    }
+
     public Map<String, Boolean> getPresenceSnapshot() {
         return Collections.unmodifiableMap(
                 new HashMap<>(presenceByUsername));

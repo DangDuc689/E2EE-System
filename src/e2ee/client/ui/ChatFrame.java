@@ -144,6 +144,21 @@ public final class ChatFrame extends JFrame {
             super.paintComponent(g);
         }
     };
+    private final JButton groupInfoButton = new JButton() {
+        @Override
+        protected void paintComponent(Graphics g) {
+            Graphics2D g2 = (Graphics2D) g.create();
+            g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING,
+                    RenderingHints.VALUE_ANTIALIAS_ON);
+            g2.setColor(getModel().isRollover() && isEnabled()
+                    ? new Color(241, 245, 249) : BG_WHITE);
+            g2.fillRoundRect(0, 0, getWidth() - 1, getHeight() - 1, 8, 8);
+            g2.setColor(BORDER_COLOR);
+            g2.drawRoundRect(0, 0, getWidth() - 1, getHeight() - 1, 8, 8);
+            g2.dispose();
+            super.paintComponent(g);
+        }
+    };
     private final JPanel chatHeader = new JPanel(new BorderLayout());
     private final AvatarBadgePanel peerHeaderAvatar =
             new AvatarBadgePanel("", false, 38, null, false);
@@ -247,7 +262,7 @@ public final class ChatFrame extends JFrame {
         profileCard.add(myAvatar, BorderLayout.WEST);
         profileCard.add(myInfoPanel, BorderLayout.CENTER);
 
-        // 2. Ô tìm kiếm và nút "+ Tạo nhóm"
+        // 2. Ô tìm kiếm và nút "Tạo nhóm"
         JPanel searchAndAddPanel = new JPanel(new BorderLayout(8, 0));
         searchAndAddPanel.setOpaque(false);
 
@@ -268,7 +283,7 @@ public final class ChatFrame extends JFrame {
         searchBox.add(addFriendField, BorderLayout.CENTER);
         searchAndAddPanel.add(searchBox, BorderLayout.CENTER);
 
-        JButton createGroupBtn = new JButton("+ Tạo nhóm") {
+        JButton createGroupBtn = new JButton("Tạo nhóm") {
             @Override
             protected void paintComponent(Graphics g) {
                 Graphics2D g2 = (Graphics2D) g.create();
@@ -344,6 +359,7 @@ public final class ChatFrame extends JFrame {
         sidebarFooter.setBorder(BorderFactory.createEmptyBorder(8, 2, 2, 2));
 
         serverStatusLabel.setIcon(new DotIcon(SERVER_CONNECTED_COLOR, 8));
+        serverStatusLabel.setIconTextGap(6);
         serverStatusLabel.setFont(serverStatusLabel.getFont().deriveFont(Font.PLAIN, 12f));
         serverStatusLabel.setForeground(TEXT_DARK);
 
@@ -386,6 +402,7 @@ public final class ChatFrame extends JFrame {
 
         conversationSubtitle.setFont(new Font("Segoe UI", Font.PLAIN, 12));
         conversationSubtitle.setForeground(TEXT_MUTED);
+        conversationSubtitle.setIconTextGap(5);
         conversationSubtitle.setVisible(false);
 
         textInfoPanel.add(javax.swing.Box.createVerticalGlue());
@@ -408,8 +425,23 @@ public final class ChatFrame extends JFrame {
         securityButton.setEnabled(false);
         securityButton.setVisible(false);
 
+        // Nút Thông tin nhóm ở góc phải (icon vector vòng tròn chấm tâm [⊙])
+        groupInfoButton.setIcon(new InfoCircleIcon(new Color(51, 65, 85), 18));
+        groupInfoButton.setToolTipText("Xem thông tin và thành viên nhóm");
+        groupInfoButton.setContentAreaFilled(false);
+        groupInfoButton.setFocusPainted(false);
+        groupInfoButton.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        groupInfoButton.setBorder(BorderFactory.createEmptyBorder(6, 10, 6, 10));
+        groupInfoButton.setEnabled(false);
+        groupInfoButton.setVisible(false);
+
+        JPanel headerRight = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 0));
+        headerRight.setOpaque(false);
+        headerRight.add(securityButton);
+        headerRight.add(groupInfoButton);
+
         chatHeader.add(headerLeft, BorderLayout.CENTER);
-        chatHeader.add(securityButton, BorderLayout.EAST);
+        chatHeader.add(headerRight, BorderLayout.EAST);
 
         // Vùng hiển thị tin nhắn
         messagesPanel.setLayout(
@@ -532,6 +564,7 @@ public final class ChatFrame extends JFrame {
                 actions.onOpenSecurity(selectedPeer);
             }
         });
+        groupInfoButton.addActionListener(event -> openGroupInfoDialog());
         messageInput.addKeyListener(new KeyAdapter() {
             @Override
             public void keyPressed(KeyEvent event) {
@@ -597,6 +630,11 @@ public final class ChatFrame extends JFrame {
         }
         if (Objects.equals(username, selectedPeer)) {
             peerHeaderAvatar.update(username, online);
+            if (!friend.isGroup()) {
+                conversationSubtitle.setIcon(new DotIcon(online ? ONLINE_COLOR : OFFLINE_COLOR, 7));
+                conversationSubtitle.setText(online ? "Trực tuyến" : "Ngoại tuyến");
+                conversationSubtitle.setForeground(online ? ONLINE_COLOR : TEXT_MUTED);
+            }
         }
         friendList.repaint();
     }
@@ -704,6 +742,24 @@ public final class ChatFrame extends JFrame {
         dialog.setVisible(true);
     }
 
+    private void openGroupInfoDialog() {
+        if (selectedPeer == null) {
+            return;
+        }
+        FriendItem item = friends.get(selectedPeer);
+        if (item == null || !item.isGroup()) {
+            return;
+        }
+        GroupInfoDialog dialog = new GroupInfoDialog(
+                this,
+                item.getUsername(),
+                item.getDisplayName(),
+                item.getMembers(),
+                actions::getMemberTrustState,
+                actions::onOpenSecurity);
+        dialog.setVisible(true);
+    }
+
     public void setPeerSendAllowed(String username, boolean allowed) {
         requireEdt();
         sendAllowed.put(username, allowed);
@@ -762,6 +818,7 @@ public final class ChatFrame extends JFrame {
         if (selectedPeer == null) {
             peerHeaderAvatar.setVisible(false);
             conversationTitle.setText("Chọn một cuộc trò chuyện");
+            conversationSubtitle.setIcon(null);
             conversationSubtitle.setVisible(false);
         } else {
             FriendItem item = friends.get(selectedPeer);
@@ -772,24 +829,18 @@ public final class ChatFrame extends JFrame {
                 conversationTitle.setText(item.getDisplayName());
 
                 int memberCount = item.getMembers().size();
-                int onlineCount = 0;
-                for (String m : item.getMembers()) {
-                    FriendItem f = friends.get(m);
-                    if (f != null && f.isOnline()) {
-                        onlineCount++;
-                    }
-                }
-                if (onlineCount == 0 && memberCount > 0) {
-                    onlineCount = 1;
-                }
-                conversationSubtitle.setText(memberCount + " thành viên • " + onlineCount + " trực tuyến");
+                conversationSubtitle.setIcon(null);
+                conversationSubtitle.setText(memberCount + " thành viên");
+                conversationSubtitle.setForeground(TEXT_MUTED);
                 conversationSubtitle.setVisible(true);
             } else {
                 boolean isOnline = item != null && item.isOnline();
                 peerHeaderAvatar.update(selectedPeer, isOnline);
                 peerHeaderAvatar.setVisible(true);
                 conversationTitle.setText(selectedPeer);
+                conversationSubtitle.setIcon(new DotIcon(isOnline ? ONLINE_COLOR : OFFLINE_COLOR, 7));
                 conversationSubtitle.setText(isOnline ? "Trực tuyến" : "Ngoại tuyến");
+                conversationSubtitle.setForeground(isOnline ? ONLINE_COLOR : TEXT_MUTED);
                 conversationSubtitle.setVisible(true);
             }
 
@@ -828,6 +879,8 @@ public final class ChatFrame extends JFrame {
         sendButton.setForeground(allowed ? Color.WHITE : new Color(148, 163, 184));
         securityButton.setEnabled(hasPeer && !isGroup);
         securityButton.setVisible(hasPeer && !isGroup);
+        groupInfoButton.setEnabled(hasPeer && isGroup);
+        groupInfoButton.setVisible(hasPeer && isGroup);
         if (isGroup) {
             ttlSelector.setEnabled(false);
             ttlSelector.setSelectedIndex(0);
@@ -1058,6 +1111,10 @@ public final class ChatFrame extends JFrame {
 
         default void onCreateGroup(String groupId, String groupName, List<String> memberUsernames) {
             onCreateGroup(groupName, memberUsernames);
+        }
+
+        default e2ee.client.ChatClientController.MemberTrustState getMemberTrustState(String username) {
+            return e2ee.client.ChatClientController.MemberTrustState.UNKNOWN;
         }
     }
 
@@ -1350,6 +1407,46 @@ public final class ChatFrame extends JFrame {
     }
 
     /**
+     * Icon vòng tròn chấm tâm vẽ vector bằng Java2D cho nút Thông tin nhóm (không dùng emoji).
+     */
+    private static final class InfoCircleIcon implements Icon {
+        private final Color color;
+        private final int size;
+
+        private InfoCircleIcon(Color color, int size) {
+            this.color = color;
+            this.size = size;
+        }
+
+        @Override
+        public void paintIcon(Component c, Graphics g, int x, int y) {
+            Graphics2D g2 = (Graphics2D) g.create();
+            g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING,
+                    RenderingHints.VALUE_ANTIALIAS_ON);
+            g2.setRenderingHint(RenderingHints.KEY_STROKE_CONTROL,
+                    RenderingHints.VALUE_STROKE_PURE);
+            g2.setColor(color);
+            g2.setStroke(new BasicStroke(1.5f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+            int pad = 2;
+            int diameter = size - pad * 2;
+            g2.drawOval(x + pad, y + pad, diameter, diameter);
+            int dot = 4;
+            g2.fillOval(x + (size - dot) / 2, y + (size - dot) / 2, dot, dot);
+            g2.dispose();
+        }
+
+        @Override
+        public int getIconWidth() {
+            return size;
+        }
+
+        @Override
+        public int getIconHeight() {
+            return size;
+        }
+    }
+
+    /**
      * Icon chấm tròn trạng thái vẽ vector bằng Java2D.
      */
     private static final class DotIcon implements Icon {
@@ -1367,14 +1464,13 @@ public final class ChatFrame extends JFrame {
             g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING,
                     RenderingHints.VALUE_ANTIALIAS_ON);
             g2.setColor(color);
-            int cy = y + (c.getHeight() - size) / 2;
-            g2.fillOval(x, cy, size, size);
+            g2.fillOval(x, y, size, size);
             g2.dispose();
         }
 
         @Override
         public int getIconWidth() {
-            return size + 4;
+            return size;
         }
 
         @Override
@@ -1638,7 +1734,7 @@ public final class ChatFrame extends JFrame {
             String[] lines = content.split("\n", -1);
             int naturalWidth = 0;
             for (String line : lines) {
-                int lineW = fm.stringWidth(line);
+                int lineW = fm.stringWidth(line) + 6;
                 if (lineW > naturalWidth) {
                     naturalWidth = lineW;
                 }
@@ -1646,16 +1742,9 @@ public final class ChatFrame extends JFrame {
             int metaWidth = metaLabel.getPreferredSize().width;
             int unconstrainedWidth = Math.max(naturalWidth, metaWidth);
 
-            int targetTextWidth;
-            int targetTextHeight;
-            if (unconstrainedWidth <= maxTextWidth) {
-                targetTextWidth = unconstrainedWidth;
-                targetTextHeight = Math.max(fm.getHeight(), lines.length * fm.getHeight());
-            } else {
-                targetTextWidth = maxTextWidth;
-                msgText.setSize(maxTextWidth, Short.MAX_VALUE);
-                targetTextHeight = msgText.getPreferredSize().height;
-            }
+            int targetTextWidth = Math.min(unconstrainedWidth, maxTextWidth);
+            msgText.setSize(targetTextWidth, Short.MAX_VALUE);
+            int targetTextHeight = msgText.getPreferredSize().height;
 
             msgText.setPreferredSize(new Dimension(targetTextWidth, targetTextHeight));
             int bubbleW = targetTextWidth + 32;

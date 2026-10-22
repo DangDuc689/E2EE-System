@@ -114,6 +114,11 @@ public class ClientMain {
         }
 
         @Override
+        public ChatClientController.MemberTrustState getMemberTrustState(String username) {
+            return controller.getMemberTrustState(username);
+        }
+
+        @Override
         public void onClose() {
             shutdown();
         }

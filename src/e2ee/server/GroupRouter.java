@@ -4,8 +4,10 @@ import e2ee.common.contract.Envelope;
 import e2ee.common.contract.Opcode;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -14,17 +16,19 @@ import java.util.concurrent.ConcurrentMap;
  * Định tuyến quản lý nhóm (GROUP_CREATE) và chuyển tiếp tin nhắn nhóm E2EE (CHAT_GROUP).
  *
  * <p>Server đóng vai trò Blind Relay:
- * 1. Quản lý danh bạ nhóm trong RAM: groupId -> Set&lt;String&gt; memberUsernames.
- * 2. Khi nhận GROUP_CREATE: Lưu nhóm và danh sách thành viên vào sổ.
+ * 1. Quản lý danh bạ nhóm trong RAM & Store: groupId -> Set&lt;String&gt; memberUsernames.
+ * 2. Khi nhận GROUP_CREATE: Từ chối nếu groupId trùng; Lưu nhóm và phát snapshot tới các thành viên online.
  * 3. Khi nhận CHAT_GROUP: Chuyển tiếp mù nguyên vẹn Envelope tới toàn bộ thành viên
- *    trong nhóm đang online (ngoại trừ người gửi).
+ *    trong nhóm đang online (ngoại trừ người gửi) hoặc đưa vào hàng đợi offline.
  * 4. Chuyển tiếp các gói tin khác (CHAT_1TO1, KEY_LOOKUP) sang MessageRouter kế tiếp.</p>
  */
 public final class GroupRouter implements MessageRouter {
     private final ConcurrentMap<String, ClientHandler> onlineUsers;
     private final ConcurrentMap<String, Set<String>> groupRegistry;
+    private final ConcurrentMap<String, String> groupNames = new ConcurrentHashMap<>();
     private final OfflineMessageQueue offlineQueue;
     private final MessageRouter nextRouter;
+    private final ServerGroupStore groupStore;
 
     public GroupRouter(
             ConcurrentMap<String, ClientHandler> onlineUsers,
@@ -44,10 +48,23 @@ public final class GroupRouter implements MessageRouter {
             ConcurrentMap<String, Set<String>> groupRegistry,
             OfflineMessageQueue offlineQueue,
             MessageRouter nextRouter) {
+        this(onlineUsers, groupRegistry, offlineQueue, nextRouter, null);
+    }
+
+    public GroupRouter(
+            ConcurrentMap<String, ClientHandler> onlineUsers,
+            ConcurrentMap<String, Set<String>> groupRegistry,
+            OfflineMessageQueue offlineQueue,
+            MessageRouter nextRouter,
+            ServerGroupStore groupStore) {
         this.onlineUsers = onlineUsers;
         this.groupRegistry = groupRegistry;
         this.offlineQueue = offlineQueue;
         this.nextRouter = nextRouter;
+        this.groupStore = groupStore;
+        if (groupStore != null) {
+            this.groupNames.putAll(groupStore.getGroupNames());
+        }
     }
 
     @Override
@@ -73,6 +90,23 @@ public final class GroupRouter implements MessageRouter {
         }
 
         Object membersObj = env.get("members");
+        if (membersObj == null && groupRegistry.containsKey(groupId)) {
+            Set<String> members = groupRegistry.get(groupId);
+            String gName = getGroupName(groupId);
+            String targetUser = sender != null ? sender.authenticatedUsername() : env.getFrom();
+            Envelope snapshot = createSnapshotEnvelope(groupId, gName, members, targetUser);
+            if (sender != null) {
+                sender.sendRouterEnvelope(snapshot);
+            }
+            return;
+        }
+
+        // Từ chối nếu ID nhóm đã tồn tại để tránh âm thầm ghi đè thành viên
+        if (groupRegistry.containsKey(groupId)) {
+            sender.sendRouterError("GROUP_ALREADY_EXISTS", "Group already exists: " + groupId);
+            return;
+        }
+
         if (!(membersObj instanceof Collection<?> rawMembers)) {
             sender.sendRouterError("INVALID_MEMBERS", "members list cannot be empty");
             return;
@@ -88,20 +122,58 @@ public final class GroupRouter implements MessageRouter {
             }
         }
 
-        // Đảm bảo người tạo cũng nằm trong danh sách thành viên nhóm
+        // Đảm bảo người tạo từ session đã xác thực cũng nằm trong danh sách thành viên nhóm
         String creator = sender != null ? sender.authenticatedUsername() : env.getFrom();
         if (creator != null && !creator.isBlank()) {
             memberSet.add(creator);
         }
 
+        String groupName = env.getString("groupName");
+        if (groupName == null || groupName.isBlank()) {
+            groupName = groupId;
+        }
+
+        // Lưu bền vững trước khi xác nhận tạo nhóm thành công
+        if (groupStore != null) {
+            try {
+                groupStore.putGroup(groupId, groupName, memberSet);
+            } catch (IOException e) {
+                if (sender != null) {
+                    sender.sendRouterError("STORE_ERROR", "Failed to persist group: " + e.getMessage());
+                }
+                return;
+            }
+        }
         groupRegistry.put(groupId, memberSet);
+        groupNames.put(groupId, groupName);
 
         // Phản hồi thông báo đã tạo nhóm thành công cho client tạo nhóm
         if (sender != null) {
             Envelope confirm = Envelope.createGroup(Opcode.GROUP_CREATE, "server", groupId)
                     .put("status", "CREATED")
-                    .put("groupId", groupId);
+                    .put("groupId", groupId)
+                    .put("groupName", groupName)
+                    .put("members", new ArrayList<>(memberSet));
+            if (creator != null) {
+                confirm.setTo(creator);
+            }
             sender.sendRouterEnvelope(confirm);
+        }
+
+        // Gửi SNAPSHOT ngay cho các thành viên khác đang online
+        for (String member : memberSet) {
+            if (member.equals(creator)) {
+                continue; // Tránh gửi lặp snapshot cho người tạo nếu đã nhận CREATED
+            }
+            ClientHandler recipient = onlineUsers.get(member);
+            if (recipient != null) {
+                Envelope snapshot = createSnapshotEnvelope(groupId, groupName, memberSet, member);
+                try {
+                    recipient.sendRoutedEnvelopeIfCurrent(member, snapshot);
+                } catch (IOException e) {
+                    recipient.closeRoutedSession();
+                }
+            }
         }
     }
 
@@ -156,9 +228,63 @@ public final class GroupRouter implements MessageRouter {
         }
     }
 
+    /**
+     * Đồng bộ danh sách các nhóm mà user tham gia khi họ vừa kết nối / đăng nhập thành công.
+     */
+    public void syncUserGroups(String username, e2ee.common.net.SocketPacketChannel channel) throws IOException {
+        if (username == null || channel == null) {
+            return;
+        }
+        for (Map.Entry<String, Set<String>> entry : groupRegistry.entrySet()) {
+            String gid = entry.getKey();
+            Set<String> members = entry.getValue();
+            if (members != null && members.contains(username)) {
+                String gName = getGroupName(gid);
+                Envelope snapshot = createSnapshotEnvelope(gid, gName, members, username);
+                channel.send(snapshot);
+            }
+        }
+    }
+
+    public static Envelope createSnapshotEnvelope(String groupId, String groupName,
+            Collection<String> members, String recipient) {
+        Envelope snapshot = Envelope.createGroup(Opcode.GROUP_CREATE, "server", groupId)
+                .put("status", "SNAPSHOT")
+                .put("groupId", groupId)
+                .put("groupName", groupName != null && !groupName.isBlank() ? groupName : groupId)
+                .put("members", new ArrayList<>(members));
+        if (recipient != null) {
+            snapshot.setTo(recipient);
+        }
+        return snapshot;
+    }
+
+    public static GroupRouter findIn(MessageRouter router) {
+        MessageRouter current = router;
+        while (current != null) {
+            if (current instanceof GroupRouter gr) {
+                return gr;
+            }
+            if (current instanceof OfflineQueueRouter oqr) {
+                current = oqr.getNextRouter();
+            } else {
+                break;
+            }
+        }
+        return null;
+    }
+
     public Set<String> getGroupMembers(String groupId) {
         Set<String> members = groupRegistry.get(groupId);
         return members != null ? Collections.unmodifiableSet(members) : Collections.emptySet();
+    }
+
+    public String getGroupName(String groupId) {
+        String name = groupNames.get(groupId);
+        if (name != null) {
+            return name;
+        }
+        return groupStore != null ? groupStore.getGroupName(groupId) : groupId;
     }
 
     public ConcurrentMap<String, Set<String>> getGroupRegistry() {

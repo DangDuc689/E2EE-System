@@ -217,25 +217,75 @@ public class GroupCryptoService {
      * @param myPrivateKey Khóa riêng của người gửi để ký số
      * @param membersHash Chuỗi Base64 hash thành viên nhóm
      * @return Envelope CHAT_GROUP hoàn chỉnh
-     * @throws GeneralSecurityException khi lỗi mã hóa hoặc ký số
+    /**
+     * DTO chứa kết quả giải mã tin nhắn nhóm gồm nội dung, thời điểm hết hạn và TTL.
      */
+    public static final class DecryptedGroupMessage {
+        private final String content;
+        private final long expiresAt;
+        private final int ttlSeconds;
+
+        public DecryptedGroupMessage(String content, long expiresAt, int ttlSeconds) {
+            this.content = content != null ? content : "";
+            this.expiresAt = Math.max(0L, expiresAt);
+            this.ttlSeconds = Math.max(0, ttlSeconds);
+        }
+
+        public String getContent() {
+            return content;
+        }
+
+        public long getExpiresAt() {
+            return expiresAt;
+        }
+
+        public int getTtlSeconds() {
+            return ttlSeconds;
+        }
+
+        public boolean isExpired() {
+            return isExpired(System.currentTimeMillis());
+        }
+
+        public boolean isExpired(long now) {
+            return expiresAt > 0 && expiresAt <= now;
+        }
+    }
+
     public Envelope createEncryptedGroupMessage(String from, String groupId, String content,
                                                 Map<String, PublicKey> recipientKeys,
                                                 PrivateKey myPrivateKey,
                                                 String membersHash)
+            throws GeneralSecurityException {
+        return createEncryptedGroupMessage(from, groupId, content, recipientKeys, myPrivateKey, membersHash, 0);
+    }
+
+    public Envelope createEncryptedGroupMessage(String from, String groupId, String content,
+                                                Map<String, PublicKey> recipientKeys,
+                                                PrivateKey myPrivateKey,
+                                                String membersHash,
+                                                int ttlSeconds)
             throws GeneralSecurityException {
         if (from == null || groupId == null || content == null
                 || recipientKeys == null || recipientKeys.isEmpty()
                 || myPrivateKey == null || membersHash == null) {
             throw new IllegalArgumentException("Cac tham so khong duoc null hoac rong");
         }
+        if (ttlSeconds < 0 || ttlSeconds > 86_400) {
+            throw new IllegalArgumentException("TTL khong hop le");
+        }
 
         // 1. Tạo Envelope CHAT_GROUP
         Envelope env = Envelope.createGroup(Opcode.CHAT_GROUP, from, groupId);
 
-        // 2. Chuẩn bị bản rõ JSON: {"content": "..."}
+        // 2. Chuẩn bị bản rõ JSON: {"content": "..."} kèm ttl và expires_at nếu ttlSeconds > 0
         Map<String, Object> plaintextJsonMap = new LinkedHashMap<>();
         plaintextJsonMap.put("content", content);
+        if (ttlSeconds > 0) {
+            long expiresAt = env.getTs() + (long) ttlSeconds * 1_000L;
+            plaintextJsonMap.put("ttl", (long) ttlSeconds);
+            plaintextJsonMap.put("expires_at", expiresAt);
+        }
         String plaintextJson = MiniJson.stringify(plaintextJsonMap);
         byte[] plaintextBytes = plaintextJson.getBytes(StandardCharsets.UTF_8);
 
@@ -322,6 +372,26 @@ public class GroupCryptoService {
                                                PrivateKey myPrivateKey,
                                                String expectedMembersHash,
                                                boolean isOfflineSync)
+            throws GeneralSecurityException, JsonParseException {
+        return verifyAndDecryptGroup(env, myUsername, senderPublicKey, myPrivateKey, expectedMembersHash, isOfflineSync).getContent();
+    }
+
+    /**
+     * Xác minh chữ ký số và giải mã tin nhắn nhóm CHAT_GROUP, trả về DecryptedGroupMessage đầy đủ:
+     * - Kiểm tra Anti-Replay sơ bộ: từ chối ID trùng lặp, kiểm tra skew +-120s đối với tin live.
+     * - Chống Ghost Member: So khớp members_hash với expectedMembersHash. Nếu lệch -> chặn ngay!
+     * - Tái tạo Canonical Form: from|groupId|keysCanonical|iv|Base64(aad)|ct|members_hash.
+     * - XÁC MINH CHỮ KÝ SỐ TRƯỚC KHI GIẢI MÃ bằng Public Key của người gửi.
+     * - Tìm khóa AES bọc cho myUsername trong keys, mở bọc bằng Private Key của mình.
+     * - Giải mã AES-GCM với AAD và trích xuất nội dung tin nhắn, thời hạn TTL.
+     * - BẤT BIẾN AN TOÀN: GHI NHẬN ID vào seenMessageIds CHỈ SAU KHI verify và giải mã thành công!
+     */
+    public DecryptedGroupMessage verifyAndDecryptGroup(Envelope env,
+                                                       String myUsername,
+                                                       PublicKey senderPublicKey,
+                                                       PrivateKey myPrivateKey,
+                                                       String expectedMembersHash,
+                                                       boolean isOfflineSync)
             throws GeneralSecurityException, JsonParseException {
         if (env == null || myUsername == null || senderPublicKey == null
                 || myPrivateKey == null || expectedMembersHash == null) {
@@ -426,7 +496,7 @@ public class GroupCryptoService {
             // Giải mã AES-GCM với AAD
             plaintextBytes = ClientCryptoEngine.decryptAesGcm(ctBytes, aesKey, ivBytes, aadBytes);
 
-            // Trích xuất nội dung JSON
+            // Trích xuất nội dung JSON và TTL
             String jsonPlaintext = new String(plaintextBytes, StandardCharsets.UTF_8);
             Map<String, Object> map = MiniJson.parseObject(jsonPlaintext);
             Object contentObj = map.get("content");
@@ -434,10 +504,21 @@ public class GroupCryptoService {
                 throw new SecurityException("Ban ro JSON thieu truong 'content': " + jsonPlaintext);
             }
 
+            int ttlSeconds = 0;
+            long expiresAt = 0L;
+            Object ttlObj = map.get("ttl");
+            if (ttlObj instanceof Number n) {
+                ttlSeconds = n.intValue();
+            }
+            Object expObj = map.get("expires_at");
+            if (expObj instanceof Number n) {
+                expiresAt = n.longValue();
+            }
+
             // 9. BẤT BIẾN AN TOÀN: CHỈ ghi nhận ID vào seenMessageIds SAU KHI verify & giải mã thành công!
             seenMessageIds.add(msgId);
 
-            return String.valueOf(contentObj);
+            return new DecryptedGroupMessage(String.valueOf(contentObj), expiresAt, ttlSeconds);
         } finally {
             ClientCryptoEngine.wipeMemory(wrappedKeyBytes);
             ClientCryptoEngine.wipeMemory(plaintextBytes);

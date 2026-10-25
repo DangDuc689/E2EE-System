@@ -81,6 +81,34 @@ public final class ClientIdentityStore {
     }
 
     /**
+     * Sinh cặp khóa mới và ghi đè danh tính cũ để đổi khóa.
+     */
+    public Identity rotate(String username, char[] passphrase)
+            throws IOException, GeneralSecurityException {
+        validateUsername(username);
+        validatePassphrase(passphrase);
+        Path privateKeyFile = privateKeyFile(username);
+        Path publicKeyFile = publicKeyFile(username);
+        if (!Files.isRegularFile(privateKeyFile)
+                || !Files.isRegularFile(publicKeyFile)) {
+            throw new IOException("Khong tim thay danh tinh de doi khoa: " + username);
+        }
+
+        Files.createDirectories(identitiesDirectory);
+        KeyPair keyPair = ClientCryptoEngine.generateRsaKeyPair();
+        ClientCryptoEngine.savePrivateKey(
+                privateKeyFile.toFile(), keyPair.getPrivate(), passphrase);
+        String publicKeyBase64 = Base64.getEncoder()
+                .encodeToString(keyPair.getPublic().getEncoded());
+        Files.writeString(publicKeyFile, publicKeyBase64,
+                StandardCharsets.UTF_8,
+                StandardOpenOption.CREATE,
+                StandardOpenOption.TRUNCATE_EXISTING,
+                StandardOpenOption.WRITE);
+        return new Identity(username, keyPair.getPublic(), keyPair.getPrivate());
+    }
+
+    /**
      * Mở danh tính cũ và kiểm tra public/private key thực sự là một cặp.
      */
     public Identity load(String username, char[] passphrase)
@@ -163,12 +191,18 @@ public final class ClientIdentityStore {
         }
     }
 
+    public static Identity createEphemeral(String username, PublicKey publicKey,
+            PrivateKey privateKey) {
+        validateUsername(username);
+        return new Identity(username, publicKey, privateKey);
+    }
+
     public static final class Identity {
         private final String username;
         private final PublicKey publicKey;
         private final PrivateKey privateKey;
 
-        private Identity(String username, PublicKey publicKey,
+        public Identity(String username, PublicKey publicKey,
                 PrivateKey privateKey) {
             this.username = username;
             this.publicKey = publicKey;

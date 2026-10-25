@@ -139,11 +139,11 @@ public class OfflineSyncService {
             throw new IllegalArgumentException("Goi tin goc phai co opcode la CHAT_GROUP, nhan duoc: " + original.getOp());
         }
 
-        String content = groupCryptoService.verifyAndDecryptGroupMessage(
+        GroupCryptoService.DecryptedGroupMessage decrypted = groupCryptoService.verifyAndDecryptGroup(
                 original, myUsername, senderPublicKey, myPrivateKey, expectedMembersHash, true);
         Envelope ack = createAckEnvelope(myUsername, original.getId());
 
-        return new SyncResult(original, content, ack, 0L);
+        return new SyncResult(original, decrypted.getContent(), ack, decrypted.getExpiresAt());
     }
 
     /**

@@ -13,7 +13,7 @@ import java.io.IOException;
 /**
  * Điểm khởi chạy của ứng dụng giao diện E2EE Client (Java Swing).
  * 
- * NGUYÊN TẮC LUỒNG GIAO DIỆN (Issue 9 - Nghĩa phụ trách):
+ * NGUYÊN TẮC LUỒNG GIAO DIỆN:
  * - Toàn bộ tác vụ I/O mạng và giải mã Crypto chạy ngoài EDT (Event Dispatch Thread).
  * - Cập nhật giao diện Swing bắt buộc thông qua SwingUtilities.invokeLater.
  */
@@ -101,6 +101,31 @@ public class ClientMain {
         @Override
         public void onOpenSecurity(String username) {
             controller.requestFingerprintDetails(username);
+        }
+
+        @Override
+        public String getMyFingerprint() {
+            return controller.getMyFingerprint();
+        }
+
+        @Override
+        public void onRotateKey() {
+            controller.rotateKey();
+        }
+
+        @Override
+        public void onCreateGroup(String groupId, String groupName, java.util.List<String> memberUsernames) {
+            controller.createGroup(groupId, groupName, memberUsernames);
+        }
+
+        @Override
+        public void onSendGroupMessage(String groupId, String content, int ttlSeconds) {
+            controller.sendGroupMessage(groupId, content, ttlSeconds);
+        }
+
+        @Override
+        public ChatClientController.MemberTrustState getMemberTrustState(String username) {
+            return controller.getMemberTrustState(username);
         }
 
         @Override
@@ -280,6 +305,62 @@ public class ClientMain {
                 chatFrame.showBanner(
                         "Đã xác minh lại khóa của " + username,
                         ChatFrame.BannerType.CONNECTED);
+            }
+        }
+
+        @Override
+        public void onKeyRotated(String newFingerprint) {
+            if (chatFrame != null) {
+                chatFrame.updateMyFingerprint(newFingerprint);
+                chatFrame.showBanner("Đã đổi cặp khóa bảo mật mới thành công",
+                        ChatFrame.BannerType.CONNECTED);
+            }
+        }
+
+        @Override
+        public void onGroupCreated(String groupId, String groupName, java.util.List<String> members) {
+            if (chatFrame != null) {
+                chatFrame.addGroup(groupId, groupName, members);
+                chatFrame.selectPeer(groupId);
+                chatFrame.showBanner("Đã tạo nhóm '" + groupName + "' thành công",
+                        ChatFrame.BannerType.CONNECTED);
+            }
+        }
+
+        @Override
+        public void onGroupSnapshot(String groupId, String groupName, java.util.List<String> members) {
+            if (chatFrame != null) {
+                chatFrame.addGroup(groupId, groupName, members);
+            }
+        }
+
+        @Override
+        public void onGroupMessageSent(String groupId, String content,
+                String messageId, long timestamp) {
+            onGroupMessageSent(groupId, content, messageId, timestamp, 0);
+        }
+
+        @Override
+        public void onGroupMessageSent(String groupId, String content,
+                String messageId, long timestamp, int ttlSeconds) {
+            if (chatFrame != null) {
+                chatFrame.addGroupMessage(groupId, controller.getMyUsername(),
+                        content, timestamp, true, ttlSeconds);
+            }
+        }
+
+        @Override
+        public void onGroupMessageReceived(String groupId, String senderUsername,
+                String content, String messageId, long timestamp) {
+            onGroupMessageReceived(groupId, senderUsername, content, messageId, timestamp, 0L);
+        }
+
+        @Override
+        public void onGroupMessageReceived(String groupId, String senderUsername,
+                String content, String messageId, long timestamp, long expiresAt) {
+            if (chatFrame != null) {
+                chatFrame.addGroupMessageWithExpiry(groupId, senderUsername,
+                        content, timestamp, false, expiresAt);
             }
         }
 

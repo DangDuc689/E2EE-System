@@ -9,13 +9,14 @@
 
 ## 👥 1. THÀNH VIÊN NHÓM & BẢNG ĐÓNG GÓP (CONTRIBUTIONS)
 
-| STT | MSSV | Họ và Tên | Vai trò | Công việc phụ trách | Pull Requests (PRs) đã merge |
-| :---: | :---: | :--- | :---: | :---: | :---: |
-| 1 | `2380600525` | **Đặng Ngọc Đức** | Trưởng nhóm | Khởi tạo khung dự án NetBeans Ant & Git repo | `commit: abe30bc` |
-| 2 | `2380600006` | **Lê Tấn Bình An** | Thành viên | - | - |
-| 3 | `2380600293` | **Lê Quang Dũng** | Thành viên | - | - |
-| 4 | `2380601447` | **Nguyễn Tài Tuấn Nghĩa** | Thành viên | - | - |
-| 5 | `2380602440` | **Huỳnh Ngọc Anh Tuấn** | Thành viên | - | - |
+|      MSSV      | Họ và Tên                        | Công việc đã thực hiện                                                                                                                                                                                                               |         Merge Requests         |
+| :------------: | :---------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :----------------------------: |
+| `2380600525` | **Đặng Ngọc Đức**        | Khởi tạo cấu trúc dự án chuẩn JDK 17, Framing TCP & MiniJson; Phát triển hệ thống E2EE Group Chat hoàn chỉnh (Hạ tầng lưu trữ nhóm Server/Client Store, đổi khóa, giao diện tạo/quản lý nhóm Swing & TTL nhóm) | `!2`, `!4`, `!6`,`!25` |
+| `2380600006` | **Lê Tấn Bình An**         | Xây dựng Server Socket Core (TCP ThreadPool 50 clients), SessionSnapshot, PublicKeyRegistry, xác thực AUTH Challenge-Response & Presence Dispatcher                                                                                    |        `!17`, `!18`        |
+| `2380602440` | **Huỳnh Ngọc Anh Tuấn**    | Phát triển Client Crypto Engine (RSA-2048 OAEP, AES-256-GCM, SHA-256), bọc khóa bí mật bằng passphrase & quản lý danh tính cục bộ (ClientIdentityStore)                                                                        |        `!15`, `!16`        |
+| `2380600293` | **Lê Quang Dũng**           | Phát triển module mã hóa nhóm độc lập `GroupCryptoService` (Multi-recipient AES wrap) & Hàng đợi lưu trữ tạm tin nhắn ngoại tuyến phía Server (OfflineMessageQueue, Router & ACK)                                      |        `!19`, `!20`        |
+| `2380601447` | **Nguyễn Tài Tuấn Nghĩa** | Lập trình giao diện Java Swing (ChatFrame, LoginFrame), điều phối mạng Client Core (ChatClientController), Trust Store TOFU, đối soát Fingerprint & tin nhắn tự hủy TTL                                                       |        `!21`, `!23`        |
+
 
 ---
 

@@ -13,7 +13,7 @@ import java.io.IOException;
 /**
  * Điểm khởi chạy của ứng dụng giao diện E2EE Client (Java Swing).
  * 
- * NGUYÊN TẮC LUỒNG GIAO DIỆN (Issue 9 - Nghĩa phụ trách):
+ * NGUYÊN TẮC LUỒNG GIAO DIỆN:
  * - Toàn bộ tác vụ I/O mạng và giải mã Crypto chạy ngoài EDT (Event Dispatch Thread).
  * - Cập nhật giao diện Swing bắt buộc thông qua SwingUtilities.invokeLater.
  */
@@ -101,6 +101,16 @@ public class ClientMain {
         @Override
         public void onOpenSecurity(String username) {
             controller.requestFingerprintDetails(username);
+        }
+
+        @Override
+        public String getMyFingerprint() {
+            return controller.getMyFingerprint();
+        }
+
+        @Override
+        public void onRotateKey() {
+            controller.rotateKey();
         }
 
         @Override
@@ -294,6 +304,15 @@ public class ClientMain {
                 chatFrame.setPeerSendAllowed(username, true);
                 chatFrame.showBanner(
                         "Đã xác minh lại khóa của " + username,
+                        ChatFrame.BannerType.CONNECTED);
+            }
+        }
+
+        @Override
+        public void onKeyRotated(String newFingerprint) {
+            if (chatFrame != null) {
+                chatFrame.updateMyFingerprint(newFingerprint);
+                chatFrame.showBanner("Đã đổi cặp khóa bảo mật mới thành công",
                         ChatFrame.BannerType.CONNECTED);
             }
         }

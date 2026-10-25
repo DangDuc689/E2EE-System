@@ -304,7 +304,7 @@ public final class ChatClientControllerGroupTest {
             TestSupport.assertEquals("Tin nhan nhom tu huy", dec.getContent());
             TestSupport.assertEquals(10, dec.getTtlSeconds());
             TestSupport.assertTrue(dec.getExpiresAt() > System.currentTimeMillis(), "expiresAt phai trong tuong lai");
-            TestSupport.assertFalse(dec.isExpired(), "Tin nhan chua duoc het han ngay");
+            TestSupport.assertTrue(!dec.isExpired(), "Tin nhan chua duoc het han ngay");
         } finally {
             session.close();
             context.delete();
@@ -350,7 +350,7 @@ public final class ChatClientControllerGroupTest {
 
             // 2. Alice listener KHONG duoc phep nhan duoc callback groupReceived (vi tin da qua han)
             boolean receivedOnUi = session.listener.groupReceived.await(500, TimeUnit.MILLISECONDS);
-            TestSupport.assertFalse(receivedOnUi, "Tin nhan qua han khong duoc hien thi len UI!");
+            TestSupport.assertTrue(!receivedOnUi, "Tin nhan qua han khong duoc hien thi len UI!");
         } finally {
             session.close();
             context.delete();

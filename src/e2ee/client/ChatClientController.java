@@ -79,6 +79,7 @@ public final class ChatClientController implements AutoCloseable {
     private volatile PacketChannel channel;
     private volatile PacketChannel connectingChannel;
     private volatile Identity identity;
+    private volatile char[] sessionPassphrase;
     private volatile ScheduledFuture<?> keepAliveTask;
     private volatile ScheduledFuture<?> reconnectTask;
     private volatile String connectionHost;
@@ -184,6 +185,18 @@ public final class ChatClientController implements AutoCloseable {
     public String getMyUsername() {
         Identity currentIdentity = identity;
         return currentIdentity != null ? currentIdentity.getUsername() : null;
+    }
+
+    public String getMyFingerprint() {
+        Identity currentIdentity = identity;
+        if (currentIdentity == null || currentIdentity.getPublicKey() == null) {
+            return "Chưa có khóa";
+        }
+        try {
+            return ClientCryptoService.calculateFingerprint(currentIdentity.getPublicKey());
+        } catch (GeneralSecurityException e) {
+            return "Không thể tính vân tay";
+        }
     }
 
     public void setListener(Listener listener) {
@@ -572,6 +585,48 @@ public final class ChatClientController implements AutoCloseable {
     }
 
     /**
+     * Sinh cặp khóa RSA mới, cập nhật danh tính và gửi KEY_PUBLISH lên Server.
+     */
+    public void rotateKey() {
+        Identity currentIdentity = identity;
+        PacketChannel currentChannel = channel;
+        if (state != State.CONNECTED || currentIdentity == null || currentChannel == null) {
+            dispatchError("NOT_CONNECTED", "Client chua ket noi");
+            return;
+        }
+
+        backgroundExecutor.execute(() -> {
+            try {
+                char[] pass = sessionPassphrase;
+                Identity newIdentity;
+                if (pass != null && identityStore.exists(currentIdentity.getUsername())) {
+                    newIdentity = identityStore.rotate(currentIdentity.getUsername(), pass);
+                } else {
+                    java.security.KeyPair keyPair = ClientCryptoEngine.generateRsaKeyPair();
+                    newIdentity = ClientIdentityStore.createEphemeral(
+                            currentIdentity.getUsername(), keyPair.getPublic(), keyPair.getPrivate());
+                }
+
+                Envelope keyPublish = Envelope.create(
+                        Opcode.KEY_PUBLISH, newIdentity.getUsername(), "server")
+                        .put("pubkey", newIdentity.getPublicKeyBase64());
+
+                if (currentChannel != channel || !currentChannel.isOpen()) {
+                    dispatchError("NOT_CONNECTED", "Client da mat ket noi");
+                    return;
+                }
+
+                currentChannel.send(keyPublish);
+                identity = newIdentity;
+                String fingerprint = ClientCryptoService.calculateFingerprint(newIdentity.getPublicKey());
+                dispatchUi(() -> listener.onKeyRotated(fingerprint));
+            } catch (GeneralSecurityException | IOException e) {
+                dispatchError("KEY_ROTATE_FAILED", e.getMessage());
+            }
+        });
+    }
+
+    /**
      * Tạo cặp khóa mới, lưu cục bộ rồi kết nối và xác thực.
      */
     public void register(String host, int port, String username,
@@ -594,6 +649,10 @@ public final class ChatClientController implements AutoCloseable {
             try {
                 Identity newIdentity = identityStore.create(
                         username, passphraseCopy);
+                synchronized (lifecycleLock) {
+                    ClientCryptoEngine.wipeMemory(sessionPassphrase);
+                    sessionPassphrase = copyPassphrase(passphraseCopy);
+                }
                 connectAndAuthenticate(host, port, newIdentity, false,
                         attempt);
             } catch (IOException | GeneralSecurityException
@@ -629,6 +688,10 @@ public final class ChatClientController implements AutoCloseable {
             try {
                 Identity loadedIdentity = identityStore.load(
                         username, passphraseCopy);
+                synchronized (lifecycleLock) {
+                    ClientCryptoEngine.wipeMemory(sessionPassphrase);
+                    sessionPassphrase = copyPassphrase(passphraseCopy);
+                }
                 connectAndAuthenticate(host, port, loadedIdentity, false,
                         attempt);
             } catch (IOException | GeneralSecurityException
@@ -651,6 +714,8 @@ public final class ChatClientController implements AutoCloseable {
             channel = null;
             connectingChannel = null;
             identity = null;
+            ClientCryptoEngine.wipeMemory(sessionPassphrase);
+            sessionPassphrase = null;
             connectionHost = null;
             connectionPort = 0;
             reconnectAttempt = 0;
@@ -943,6 +1008,12 @@ public final class ChatClientController implements AutoCloseable {
         if (!isValidUsername(username)
                 || newPublicKey == null || newPublicKey.isBlank()) {
             dispatchError("INVALID_KEY_CHANGED", "KEY_CHANGED khong hop le");
+            return;
+        }
+
+        Identity currentIdentity = identity;
+        if (currentIdentity != null && currentIdentity.getUsername().equals(username)) {
+            // Khoa cua chinh minh duoc Server broadcast lai sau KEY_PUBLISH
             return;
         }
 
@@ -1595,6 +1666,8 @@ public final class ChatClientController implements AutoCloseable {
             connectingChannel = null;
             channel = null;
             identity = null;
+            ClientCryptoEngine.wipeMemory(sessionPassphrase);
+            sessionPassphrase = null;
             connectionHost = null;
             connectionPort = 0;
             reconnectAttempt = 0;
@@ -1674,6 +1747,8 @@ public final class ChatClientController implements AutoCloseable {
             closeQuietly(channel);
             channel = null;
             identity = null;
+            ClientCryptoEngine.wipeMemory(sessionPassphrase);
+            sessionPassphrase = null;
             peerPublicKeys.clear();
             presenceByUsername.clear();
             pendingMessages.clear();
@@ -1784,6 +1859,9 @@ public final class ChatClientController implements AutoCloseable {
         default void onGroupMessageReceived(String groupId, String senderUsername,
                 String content, String messageId, long timestamp, long expiresAt) {
             onGroupMessageReceived(groupId, senderUsername, content, messageId, timestamp);
+        }
+
+        default void onKeyRotated(String newFingerprint) {
         }
     }
 

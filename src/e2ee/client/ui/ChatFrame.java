@@ -10,6 +10,7 @@ import javax.swing.DefaultListModel;
 import javax.swing.Icon;
 import javax.swing.JButton;
 import javax.swing.JComboBox;
+import javax.swing.JDialog;
 import javax.swing.JFrame;
 import javax.swing.JLabel;
 import javax.swing.JList;
@@ -159,6 +160,24 @@ public final class ChatFrame extends JFrame {
             super.paintComponent(g);
         }
     };
+    private final JButton rotateKeyButton = new JButton() {
+        @Override
+        protected void paintComponent(Graphics g) {
+            Graphics2D g2 = (Graphics2D) g.create();
+            g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING,
+                    RenderingHints.VALUE_ANTIALIAS_ON);
+            g2.setColor(getModel().isRollover() && isEnabled()
+                    ? new Color(241, 245, 249) : BG_WHITE);
+            g2.fillRoundRect(0, 0, getWidth() - 1, getHeight() - 1, 10, 10);
+            g2.setColor(BORDER_COLOR);
+            g2.drawRoundRect(0, 0, getWidth() - 1, getHeight() - 1, 10, 10);
+            g2.dispose();
+            super.paintComponent(g);
+        }
+    };
+    private JDialog myKeyDialog;
+    private JTextArea myFingerprintArea;
+    private JButton rotateButtonInDialog;
     private final JPanel chatHeader = new JPanel(new BorderLayout());
     private final AvatarBadgePanel peerHeaderAvatar =
             new AvatarBadgePanel("", false, 38, null, false);
@@ -261,6 +280,19 @@ public final class ChatFrame extends JFrame {
 
         profileCard.add(myAvatar, BorderLayout.WEST);
         profileCard.add(myInfoPanel, BorderLayout.CENTER);
+
+        rotateKeyButton.setIcon(new KeyIcon(new Color(51, 65, 85)));
+        rotateKeyButton.setToolTipText("Khóa bảo mật của tôi");
+        rotateKeyButton.setContentAreaFilled(false);
+        rotateKeyButton.setFocusPainted(false);
+        rotateKeyButton.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        rotateKeyButton.setBorder(BorderFactory.createEmptyBorder(6, 8, 6, 8));
+        rotateKeyButton.setPreferredSize(new Dimension(36, 36));
+
+        JPanel profileRight = new JPanel(new FlowLayout(FlowLayout.RIGHT, 0, 0));
+        profileRight.setOpaque(false);
+        profileRight.add(rotateKeyButton);
+        profileCard.add(profileRight, BorderLayout.EAST);
 
         // 2. Ô tìm kiếm và nút "Tạo nhóm"
         JPanel searchAndAddPanel = new JPanel(new BorderLayout(8, 0));
@@ -565,6 +597,7 @@ public final class ChatFrame extends JFrame {
             }
         });
         groupInfoButton.addActionListener(event -> openGroupInfoDialog());
+        rotateKeyButton.addActionListener(event -> openMyKeyDialog());
         messageInput.addKeyListener(new KeyAdapter() {
             @Override
             public void keyPressed(KeyEvent event) {
@@ -745,6 +778,138 @@ public final class ChatFrame extends JFrame {
                     actions.onCreateGroup(groupId, groupName, allMembers);
                 });
         dialog.setVisible(true);
+    }
+
+    private void openMyKeyDialog() {
+        if (myKeyDialog != null && myKeyDialog.isDisplayable()) {
+            myKeyDialog.toFront();
+            myKeyDialog.requestFocus();
+            return;
+        }
+        myKeyDialog = new JDialog(this, "Khóa bảo mật của tôi - " + myUsername, true);
+        myKeyDialog.setDefaultCloseOperation(JDialog.DISPOSE_ON_CLOSE);
+        myKeyDialog.setSize(520, 370);
+        myKeyDialog.setLocationRelativeTo(this);
+        myKeyDialog.setResizable(false);
+
+        JPanel root = new JPanel(new BorderLayout(0, 16));
+        root.setBackground(new Color(248, 250, 252));
+        root.setBorder(BorderFactory.createEmptyBorder(18, 20, 18, 20));
+
+        // 1. Thông tin Username và thuật toán
+        JPanel infoCard = new RoundedPanel(12, BG_WHITE, BORDER_COLOR);
+        infoCard.setLayout(new GridLayout(2, 1, 0, 4));
+        infoCard.setBorder(BorderFactory.createEmptyBorder(10, 14, 10, 14));
+
+        JLabel userLabel = new JLabel("Tài khoản: " + myUsername);
+        userLabel.setFont(new Font("Segoe UI", Font.BOLD, 13));
+        userLabel.setForeground(TEXT_DARK);
+
+        JLabel algoLabel = new JLabel("Thuật toán: RSA-2048 / OAEP-SHA256 (Mã hóa đầu cuối)");
+        algoLabel.setFont(new Font("Segoe UI", Font.PLAIN, 12));
+        algoLabel.setForeground(TEXT_MUTED);
+
+        infoCard.add(userLabel);
+        infoCard.add(algoLabel);
+
+        // 2. Ô hiển thị vân tay Fingerprint hiện tại
+        JPanel centerPanel = new JPanel(new BorderLayout(0, 6));
+        centerPanel.setOpaque(false);
+
+        JLabel fpTitle = new JLabel("VÂN TAY KHÓA HIỆN TẠI (FINGERPRINT)");
+        fpTitle.setFont(new Font("Segoe UI", Font.BOLD, 11));
+        fpTitle.setForeground(TEXT_MUTED);
+
+        String currentFp = actions.getMyFingerprint();
+        myFingerprintArea = new JTextArea(currentFp != null && !currentFp.isBlank() ? currentFp : "Chưa có khóa");
+        myFingerprintArea.setEditable(false);
+        myFingerprintArea.setFocusable(false);
+        myFingerprintArea.setLineWrap(true);
+        myFingerprintArea.setWrapStyleWord(true);
+        myFingerprintArea.setRows(3);
+        myFingerprintArea.setFont(new Font(Font.MONOSPACED, Font.BOLD, 13));
+        myFingerprintArea.setBackground(new Color(241, 245, 249));
+        myFingerprintArea.setBorder(BorderFactory.createEmptyBorder(10, 12, 10, 12));
+
+        JScrollPane fpScroll = new JScrollPane(myFingerprintArea);
+        fpScroll.setBorder(BorderFactory.createLineBorder(BORDER_COLOR));
+
+        JLabel fpHint = new JLabel("Đọc mã này cho bạn bè đối soát qua kênh ngoài (gặp trực tiếp, gọi điện).");
+        fpHint.setFont(new Font("Segoe UI", Font.PLAIN, 11));
+        fpHint.setForeground(TEXT_MUTED);
+
+        centerPanel.add(fpTitle, BorderLayout.NORTH);
+        centerPanel.add(fpScroll, BorderLayout.CENTER);
+        centerPanel.add(fpHint, BorderLayout.SOUTH);
+
+        // 3. Thanh nút điều khiển dưới đáy
+        JPanel footer = new JPanel(new BorderLayout(8, 0));
+        footer.setOpaque(false);
+
+        JButton closeBtn = new JButton("Đóng") {
+            @Override
+            protected void paintComponent(Graphics g) {
+                Graphics2D g2 = (Graphics2D) g.create();
+                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                g2.setColor(getModel().isRollover() ? new Color(241, 245, 249) : BG_WHITE);
+                g2.fillRoundRect(0, 0, getWidth() - 1, getHeight() - 1, 8, 8);
+                g2.setColor(BORDER_COLOR);
+                g2.drawRoundRect(0, 0, getWidth() - 1, getHeight() - 1, 8, 8);
+                g2.dispose();
+                super.paintComponent(g);
+            }
+        };
+        closeBtn.setFont(new Font("Segoe UI", Font.PLAIN, 12));
+        closeBtn.setForeground(new Color(51, 65, 85));
+        closeBtn.setContentAreaFilled(false);
+        closeBtn.setFocusPainted(false);
+        closeBtn.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        closeBtn.setBorder(BorderFactory.createEmptyBorder(6, 16, 6, 16));
+        closeBtn.addActionListener(e -> myKeyDialog.dispose());
+
+        rotateButtonInDialog = new JButton("Đổi khóa mới") {
+            @Override
+            protected void paintComponent(Graphics g) {
+                Graphics2D g2 = (Graphics2D) g.create();
+                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                g2.setColor(getModel().isRollover() && isEnabled() ? PRIMARY_HOVER : PRIMARY);
+                g2.fillRoundRect(0, 0, getWidth() - 1, getHeight() - 1, 8, 8);
+                g2.dispose();
+                super.paintComponent(g);
+            }
+        };
+        rotateButtonInDialog.setFont(new Font("Segoe UI", Font.BOLD, 12));
+        rotateButtonInDialog.setForeground(Color.WHITE);
+        rotateButtonInDialog.setContentAreaFilled(false);
+        rotateButtonInDialog.setFocusPainted(false);
+        rotateButtonInDialog.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        rotateButtonInDialog.setBorder(BorderFactory.createEmptyBorder(6, 16, 6, 16));
+        rotateButtonInDialog.addActionListener(e -> {
+            rotateButtonInDialog.setEnabled(false);
+            rotateButtonInDialog.setText("Đang đổi khóa...");
+            actions.onRotateKey();
+        });
+
+        footer.add(closeBtn, BorderLayout.WEST);
+        footer.add(rotateButtonInDialog, BorderLayout.EAST);
+
+        root.add(infoCard, BorderLayout.NORTH);
+        root.add(centerPanel, BorderLayout.CENTER);
+        root.add(footer, BorderLayout.SOUTH);
+
+        myKeyDialog.setContentPane(root);
+        myKeyDialog.setVisible(true);
+    }
+
+    public void updateMyFingerprint(String newFingerprint) {
+        requireEdt();
+        if (myFingerprintArea != null) {
+            myFingerprintArea.setText(newFingerprint);
+        }
+        if (rotateButtonInDialog != null) {
+            rotateButtonInDialog.setEnabled(true);
+            rotateButtonInDialog.setText("Đổi khóa mới");
+        }
     }
 
     private void openGroupInfoDialog() {
@@ -1104,6 +1269,13 @@ public final class ChatFrame extends JFrame {
 
         void onOpenSecurity(String username);
 
+        default String getMyFingerprint() {
+            return "";
+        }
+
+        default void onRotateKey() {
+        }
+
         void onClose();
 
         default void onCreateGroup(String groupName, List<String> memberUsernames) {
@@ -1443,6 +1615,50 @@ public final class ChatFrame extends JFrame {
         @Override
         public int getIconHeight() {
             return size;
+        }
+    }
+
+    /**
+     * Icon chìa khóa vẽ vector bằng Java2D cho nút Đổi khóa (không dùng emoji).
+     */
+    private static final class KeyIcon implements Icon {
+        private final Color color;
+
+        private KeyIcon(Color color) {
+            this.color = color;
+        }
+
+        @Override
+        public void paintIcon(Component c, Graphics g, int x, int y) {
+            Graphics2D g2 = (Graphics2D) g.create();
+            g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING,
+                    RenderingHints.VALUE_ANTIALIAS_ON);
+            g2.setRenderingHint(RenderingHints.KEY_STROKE_CONTROL,
+                    RenderingHints.VALUE_STROKE_PURE);
+            g2.setColor(color);
+            g2.setStroke(new BasicStroke(1.5f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+
+            // Vòng đầu chìa khóa góc trên phải
+            g2.drawOval(x + 8, y + 2, 7, 7);
+
+            // Thân chìa chéo xuống góc dưới trái
+            g2.drawLine(x + 9, y + 8, x + 2, y + 15);
+
+            // Răng chìa chéo vuông góc sang dưới phải
+            g2.drawLine(x + 4, y + 13, x + 6, y + 15);
+            g2.drawLine(x + 6, y + 11, x + 8, y + 13);
+
+            g2.dispose();
+        }
+
+        @Override
+        public int getIconWidth() {
+            return 18;
+        }
+
+        @Override
+        public int getIconHeight() {
+            return 18;
         }
     }
 

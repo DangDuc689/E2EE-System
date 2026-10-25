@@ -92,8 +92,16 @@ public final class ClientGroupStore {
         }
         String json = MiniJson.stringify(root);
         Path tempFile = storeFile.resolveSibling(storeFile.getFileName() + ".tmp");
-        Files.writeString(tempFile, json, StandardCharsets.UTF_8);
-        Files.move(tempFile, storeFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        try {
+            Files.writeString(tempFile, json, StandardCharsets.UTF_8);
+            try {
+                Files.move(tempFile, storeFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+            } catch (IOException e) {
+                Files.move(tempFile, storeFile, StandardCopyOption.REPLACE_EXISTING);
+            }
+        } finally {
+            Files.deleteIfExists(tempFile);
+        }
     }
 
     public synchronized void putGroup(String groupId, String groupName, List<String> members) throws IOException {
